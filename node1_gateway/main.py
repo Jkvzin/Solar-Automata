@@ -10,11 +10,20 @@ Role:
 - Proxies/serves static fixtures for sample loading
 """
 
+import boto3
+import uuid
+import io
+
+s3_client = boto3.client('s3', region_name='us-east-2')
+BUCKET_NAME = 'dataset-paineis-solares-joaoguilherme-joaovictor-gustavo-2026'
+sqs_client = boto3.client('sqs', region_name='us-east-2')
+QUEUE_URL = 'https://sqs.us-east-2.amazonaws.com/058835009582/fila-imagens-paineis-solares'
+
 import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Annotated
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -231,7 +240,7 @@ async def dispatch_module_to_worker(
     tags=["Analysis"],
     summary="Bulk ingestion and parallel dispatch of photovoltaic module scans"
 )
-async def analyze_bulk(files: List[UploadFile] = File(...)):
+async def analyze_bulk(files: list[UploadFile]):
     """
     Primary ingestion endpoint for the LuminaPV Console.
     Receives N module images in a single multipart request, dispatches them in
@@ -243,12 +252,36 @@ async def analyze_bulk(files: List[UploadFile] = File(...)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No files received in multipart request key 'files'."
         )
+    uploaded_keys = []
+    for file in files:
+        file_key = f"{uuid.uuid4()}-{file.filename}"
+
+        # 1. Lê a imagem inteira e guarda na variável
+        conteudo_imagem = await file.read()
+
+        # 2. Transforma a variável num arquivo virtual para a AWS
+        arquivo_virtual = io.BytesIO(conteudo_imagem)
+
+        # 3. Envia para o S3 usando o arquivo virtual
+        s3_client.upload_fileobj(
+            arquivo_virtual,
+            BUCKET_NAME,
+            file_key
+        )
+        uploaded_keys.append(file_key)
+
+        # Enviar a chave da imagem para a fila SQS
+        sqs_client.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=file_key
+        )
 
     logger.info(f"Initiating parallel bulk analysis for {len(files)} module scans...")
 
     # Read uploaded files into memory buffers concurrently
     file_payloads = []
     for f in files:
+        await f.seek(0)
         content = await f.read()
         file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png"))
 

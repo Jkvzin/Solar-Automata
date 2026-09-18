@@ -1,5 +1,5 @@
 services:
-  node2_worker:
+  node2-worker:
     build:
       context: ./node2_worker
       dockerfile: Dockerfile
@@ -32,7 +32,7 @@ services:
       - "8080:8080"
     environment:
       - PORT=8080
-      - WORKER_SERVICE_URL=http://node2_worker:8001
+      - WORKER_SERVICE_URL=http://node2-worker:8001
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node1_gateway/main.py:/app/main.py
@@ -40,7 +40,7 @@ services:
       - ./frontend:/app/frontend
       - ./fixtures:/app/fixtures
     depends_on:
-      node2_worker:
+      node2-worker:
         condition: service_healthy
     networks:
       - luminapv-network
