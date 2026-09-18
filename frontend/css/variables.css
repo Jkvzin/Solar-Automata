@@ -1,0 +1,162 @@
+/* ==========================================================================
+   LuminaPV Design Tokens & Theme Variables
+   ========================================================================== */
+
+:root {
+  --bg: #1E1E1E;
+  --surface: #252526;
+  --surface2: #333333;
+  --raised: #3E3E42;
+  --border: #2D2D30;
+  --border-strong: #3E3E42;
+  --fg: #CCCCCC;
+  --fg-strong: #FFFFFF;
+  --muted: #858585;
+  --muted2: #A0A0A0;
+  --accent: #007ACC;
+  --accent-hover: #006BA6;
+  --accent-active: #005A8C;
+  --focus: #4FA6E0;
+  --sel: #094771;
+  --hover: #2A2D2E;
+  --defect: #F44747;
+  --defect-ink: #FF6161;
+  --defect-bg: rgba(244, 71, 71, 0.20);
+  --pass: #89D185;
+  --pass2: #4EC9B0;
+  --warn: #DCDCAA;
+  --d1: #F44747;
+  --d2: #C586C0;
+  --d3: #DCDCAA;
+  --d4: #4EC9B0;
+  --d5: #569CD6;
+  --status: #005FA3;
+  --status-fg: #FFFFFF;
+  --raster-bg: #141414;
+  --grid-line: rgba(140, 140, 140, 0.16);
+  --ui: "Segoe UI", "Inter", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Consolas", "SF Mono", ui-monospace, monospace;
+}
+
+body.theme-light {
+  --bg: #FFFFFF;
+  --surface: #F3F3F3;
+  --surface2: #E7E7E7;
+  --raised: #DCDCDC;
+  --border: #E0E0E0;
+  --border-strong: #CECECE;
+  --fg: #333333;
+  --fg-strong: #000000;
+  --muted: #6B6B6B;
+  --muted2: #5A5A5A;
+  --accent: #005FB8;
+  --accent-hover: #00539F;
+  --accent-active: #004786;
+  --focus: #005FB8;
+  --sel: #ADD6FF;
+  --hover: #EAEAEA;
+  --defect: #CD3131;
+  --defect-ink: #B5202A;
+  --defect-bg: rgba(205, 49, 49, 0.16);
+  --pass: #107C10;
+  --pass2: #0E7A6B;
+  --warn: #8A6D00;
+  --d1: #CD3131;
+  --d2: #AF00DB;
+  --d3: #8A6D00;
+  --d4: #0E7A6B;
+  --d5: #0451A5;
+  --status: #005FB8;
+  --status-fg: #FFFFFF;
+  --raster-bg: #FAFAFA;
+  --grid-line: rgba(60, 60, 60, 0.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/1.45 var(--ui);
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+}
+
+.sec-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted2);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip {
+  position: absolute;
+  left: 8px;
+  top: -40px;
+  z-index: 90;
+  background: var(--accent);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 2px;
+  text-decoration: none;
+  font-size: 12px;
+}
+
+.skip:focus {
+  top: 8px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--raised);
+  border: 2px solid var(--surface);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}

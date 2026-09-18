@@ -1,0 +1,56 @@
+services:
+  node2_worker:
+    build:
+      context: ./node2_worker
+      dockerfile: Dockerfile
+    container_name: luminapv-node2-worker
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - PORT=8001
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./node2_worker/main.py:/app/main.py
+      - ./node2_worker/cv_engine.py:/app/cv_engine.py
+    networks:
+      - luminapv-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  node1_gateway:
+    build:
+      context: .
+      dockerfile: ./node1_gateway/Dockerfile
+    container_name: luminapv-node1-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - WORKER_SERVICE_URL=http://node2_worker:8001
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./node1_gateway/main.py:/app/main.py
+      - ./luminapv-el-console.html:/app/luminapv-el-console.html
+      - ./frontend:/app/frontend
+      - ./fixtures:/app/fixtures
+    depends_on:
+      node2_worker:
+        condition: service_healthy
+    networks:
+      - luminapv-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  luminapv-network:
+    driver: bridge

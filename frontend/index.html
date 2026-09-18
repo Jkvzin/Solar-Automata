@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LuminaPV · Console de Diagnóstico por Eletroluminescência</title>
+  <link rel="stylesheet" href="css/variables.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/components.css" />
+</head>
+<body>
+<a class="skip" href="#inspector">Pular para o inspetor de diagnóstico</a>
+
+<header class="topbar" data-od-id="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square"><path d="M4 6h16M4 12h10M4 18h14"/></svg></span>
+    <b>LuminaPV</b>
+    <span class="env">CONSOLE EL <b>·</b> QA ÓPTICO</span>
+  </div>
+  <span class="spacer"></span>
+  <button class="btn btn-primary" id="ingestBtn" type="button" data-od-id="cta-ingest">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+    Ingerir lote
+  </button>
+  <button class="btn" id="exportBtn" type="button" disabled data-od-id="cta-export">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>
+    Exportar relatório (CSV)
+  </button>
+  <button class="btn btn-icon" id="themeBtn" type="button" aria-label="Alternar tema claro e escuro" aria-pressed="false" data-od-id="theme-toggle">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+  </button>
+</header>
+
+<section class="metrics" aria-label="Telemetria global do lote" data-od-id="batch-metrics">
+  <div class="metric" data-od-id="metric-inspected">
+    <div class="sec-label">Total inspecionado</div>
+    <div class="metric-v" id="mInspected">—</div>
+    <div class="metric-sub" id="mInspectedSub">aguardando lote</div>
+  </div>
+  <div class="metric" data-od-id="metric-failure">
+    <div class="sec-label">Módulos com falha</div>
+    <div class="metric-v" id="mFailure">—</div>
+    <div class="metric-sub" id="mFailureSub">aguardando lote</div>
+  </div>
+  <div class="metric" data-od-id="metric-cells">
+    <div class="sec-label">Células defeituosas</div>
+    <div class="metric-v" id="mCells">—</div>
+    <div class="metric-sub" id="mCellsSub">aguardando lote</div>
+  </div>
+  <div class="metric" data-od-id="metric-degradation">
+    <div class="sec-label">Degradação média</div>
+    <div class="metric-v" id="mDegr">—</div>
+    <div class="metric-sub" id="mDegrSub">perda média de área por célula</div>
+  </div>
+  <div class="mbar" aria-hidden="true"><i id="globalBar"></i></div>
+</section>
+
+<div class="workspace">
+
+  <aside class="pane pane-explorer" data-od-id="pane-explorer" aria-label="Explorador de lotes">
+    <div class="pane-head">
+      <span class="sec-label">Explorador de lotes</span>
+      <span class="spacer"></span>
+      <span class="mono" style="font-size:10.5px;color:var(--muted2)" id="treeCount">0</span>
+    </div>
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="Selecionar capturas de eletroluminescência para análise">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" aria-hidden="true"><path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v3h16v-3"/></svg>
+      <div class="drop-t">Arraste capturas EL ou selecione</div>
+      <div class="drop-s">.png · .jpg · .tif · payload .json<br>multipart/form-data · múltipla seleção</div>
+    </div>
+    <div class="drop-row">
+      <span class="sec-label">Módulos</span>
+      <div class="seg" role="group" aria-label="Filtrar módulos por status">
+        <button type="button" data-filter="all" aria-pressed="true">TODOS</button>
+        <button type="button" data-filter="fail" aria-pressed="false">FALHA</button>
+        <button type="button" data-filter="pass" aria-pressed="false">OK</button>
+      </div>
+    </div>
+    <div class="pane-body" id="treeBody">
+      <ul class="tree" id="tree" role="listbox" aria-label="Módulos do lote"></ul>
+    </div>
+  </aside>
+
+  <section class="pane pane-viewport" data-od-id="pane-viewport" aria-label="Inspeção óptica">
+    <div class="pane-head">
+      <span class="sec-label">Inspeção óptica · eletroluminescência</span>
+      <span class="spacer"></span>
+      <span class="mono" id="vpFile" style="font-size:10.5px;color:var(--muted2)">—</span>
+      <span class="mono" id="vpGrid" style="font-size:10.5px;color:var(--muted2)">GRADE —</span>
+      <span id="vpStatus"></span>
+    </div>
+    <div class="stage" id="stage">
+      <div id="vpState"></div>
+      <div class="plate" id="plate" hidden>
+        <span class="badge-raster" id="rasterBadge" hidden>SEM RASTER · GRADE DERIVADA DO PAYLOAD</span>
+        <div class="ruler cols" id="rulerCols" aria-hidden="true"></div>
+        <div class="ruler rows" id="rulerRows" aria-hidden="true"></div>
+        <div class="grid-area">
+          <div class="cells" id="cells" aria-hidden="true"></div>
+        </div>
+      </div>
+      <div class="viewtools" role="toolbar" aria-label="Controles de visualização">
+        <button type="button" id="z11" title="Escala 1:1">1:1</button>
+        <button type="button" id="zFit" title="Ajustar à área" aria-pressed="true">AJUSTAR</button>
+        <button type="button" id="zGrid" title="Alternar grade de células" aria-pressed="true">GRADE</button>
+      </div>
+      <div class="zoomchip">ZOOM <b id="zoomVal">100%</b></div>
+    </div>
+  </section>
+
+  <aside class="pane pane-inspector" id="inspector" data-od-id="pane-inspector" aria-label="Inspetor de diagnóstico">
+    <div class="pane-head">
+      <span class="sec-label">Inspetor de diagnóstico</span>
+      <span class="spacer"></span>
+      <button class="btn btn-icon" id="insZoom" type="button" aria-label="Expandir inspetor">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" aria-hidden="true"><path d="M4 9V4h5M20 15v5h-5M20 9V4h-5M4 15v5h5"/></svg>
+      </button>
+    </div>
+    <div class="pane-body">
+      <div class="insp" id="insModule">
+        <div class="insp-head">
+          <span class="sec-label" id="insId">Nenhum módulo selecionado</span>
+          <span id="insStatus"></span>
+        </div>
+        <div class="tele-grid">
+          <div class="tele">
+            <div class="tele-k">Índice de dano</div>
+            <div class="damage ok" id="insDamage">—</div>
+          </div>
+          <div class="tele">
+            <div class="tele-k">Células defeituosas</div>
+            <div class="tele-v" id="insTally">—</div>
+            <div class="tele-v" style="font-size:10.5px;color:var(--muted2)" id="insGrid">grade —</div>
+          </div>
+          <div class="tele">
+            <div class="tele-k">Tipo predominante</div>
+            <div class="tele-v" style="font-size:12.5px" id="insDominant">—</div>
+          </div>
+          <div class="tele">
+            <div class="tele-k">Confiança média</div>
+            <div class="tele-v" id="insConf">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="insp" data-od-id="batch-profile">
+        <div class="insp-head"><span class="sec-label">Perfil de dano do lote</span><span class="mono" style="font-size:10px;color:var(--muted2)">% por módulo</span></div>
+        <canvas class="spark" id="spark" width="340" height="46" aria-label="Perfil de dano por módulo do lote"></canvas>
+      </div>
+      <div class="insp" id="cellPanel" data-od-id="cell-breakdown">
+        <div class="insp-head">
+          <span class="sec-label">Matriz de coordenadas anômalas</span>
+          <span class="spacer"></span>
+          <span class="mono" id="cellPanelCount" style="font-size:10px;color:var(--muted2)">0</span>
+        </div>
+        <div class="tw" id="cellTableWrap" style="max-height:280px">
+          <table class="cells-tbl" id="cellTable">
+            <thead><tr><th>Célula</th><th>Lin</th><th>Col</th><th>Status</th><th style="text-align:right">Conf.</th></tr></thead>
+            <tbody id="cellBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <section class="pane pane-dock" data-od-id="pane-dock" aria-label="Doca de diagnóstico">
+    <div class="dock-head">
+      <div class="dock-tabs" role="tablist" aria-label="Doca de diagnóstico">
+        <button type="button" role="tab" id="tab-payload" aria-selected="true" aria-controls="dockPayload" data-tab="payload">Payload bruto</button>
+        <button type="button" role="tab" id="tab-dist" aria-selected="false" aria-controls="dockDist" data-tab="dist">Distribuição de defeitos</button>
+        <button type="button" role="tab" id="tab-log" aria-selected="false" aria-controls="dockLog" data-tab="log">Log do lote</button>
+      </div>
+      <span class="spacer"></span>
+      <div class="dock-tool">
+        <span class="mono" id="dockEndpoint" style="font-size:10px;color:var(--muted2)">POST /api/v1/analyze/bulk</span>
+        <button class="btn" id="copyBtn" type="button">Copiar</button>
+        <button class="btn btn-icon" id="dockCollapse" type="button" aria-expanded="true" aria-controls="dockBody" aria-label="Recolher doca de diagnóstico" title="Recolher doca">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true"><path id="dockChevron" d="M6 9l6 6 6-6"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="dock-body" id="dockBody">
+      <div id="dockPayload" role="tabpanel" aria-labelledby="tab-payload">
+        <pre class="json" id="jsonOut">{ }</pre>
+      </div>
+      <div id="dockDist" role="tabpanel" aria-labelledby="tab-dist" hidden>
+        <div class="chart-wrap">
+          <canvas class="dist" id="distChart" width="640" height="132" aria-label="Contagem de defeitos por tipo no lote"></canvas>
+          <div class="legend" id="distLegend"></div>
+        </div>
+      </div>
+      <div id="dockLog" role="tabpanel" aria-labelledby="tab-log" hidden>
+        <div class="log" id="logOut"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<footer class="statusbar" data-od-id="statusbar">
+  <span class="sb"><span class="dot" id="sbDot"></span><span class="mono" id="sbState">PRONTO</span></span>
+  <span class="sb-sep" aria-hidden="true"></span>
+  <span class="sb mono" id="sbEndpoint">POST /api/v1/analyze/bulk</span>
+  <span class="sb mono" id="sbHttp">HTTP —</span>
+  <span class="spacer"></span>
+  <span class="sb mono" id="sbBatch">LOTE —</span>
+  <span class="sb-sep" aria-hidden="true"></span>
+  <span class="sb mono" id="sbActive">MÓDULO —</span>
+  <span class="sb-sep" aria-hidden="true"></span>
+  <span class="sb mono" id="sbKeys">↑↓ NAVEGAR · ENTER SELECIONAR · ESC FECHAR ZOOM</span>
+</footer>
+
+<input type="file" id="fileInput" multiple accept=".png,.jpg,.jpeg,.tif,.tiff,.json,image/*" class="sr-only" />
+<div id="tt" class="tooltip" role="tooltip"></div>
+<div id="live" class="sr-only" role="status" aria-live="polite"></div>
+
+<!-- Payload de exemplo de fallback (usado quando o fetch externo falha) -->
+<script type="application/json" id="samplePayload">
+{
+  "batch_summary": {
+    "total_modules": 5,
+    "defective_modules_count": 3,
+    "batch_failure_percentage": 60.0,
+    "average_cell_degradation_percentage": 10.4
+  },
+  "modules": [
+    {
+      "module_id": "MOD-2026-081",
+      "filename": "panel_scan_01.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 12,
+      "module_damage_percentage": 20.0,
+      "cells": [
+        { "index": 0, "row": 0, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.71 },
+        { "index": 7, "row": 0, "col": 7, "is_defective": true, "defect_type": "dead", "confidence": 0.99 },
+        { "index": 12, "row": 1, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.95 },
+        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.92 },
+        { "index": 20, "row": 2, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.79 },
+        { "index": 23, "row": 2, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.88 },
+        { "index": 30, "row": 3, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.74 },
+        { "index": 35, "row": 3, "col": 5, "is_defective": true, "defect_type": "dead", "confidence": 0.97 },
+        { "index": 42, "row": 4, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.84 },
+        { "index": 45, "row": 4, "col": 5, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.91 },
+        { "index": 50, "row": 5, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.68 },
+        { "index": 58, "row": 5, "col": 8, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.90 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-082",
+      "filename": "panel_scan_02.png",
+      "status": "PASS",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 1,
+      "module_damage_percentage": 1.7,
+      "cells": [
+        { "index": 15, "row": 1, "col": 5, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.64 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-083",
+      "filename": "panel_scan_03.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 7,
+      "module_damage_percentage": 11.7,
+      "cells": [
+        { "index": 2, "row": 0, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.93 },
+        { "index": 11, "row": 1, "col": 1, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.89 },
+        { "index": 18, "row": 1, "col": 8, "is_defective": true, "defect_type": "dead", "confidence": 0.96 },
+        { "index": 22, "row": 2, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.91 },
+        { "index": 33, "row": 3, "col": 3, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.85 },
+        { "index": 44, "row": 4, "col": 4, "is_defective": true, "defect_type": "delamination", "confidence": 0.77 },
+        { "index": 59, "row": 5, "col": 9, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.65 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-084",
+      "filename": "panel_scan_04.png",
+      "status": "PASS",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 0,
+      "module_damage_percentage": 0.0,
+      "cells": []
+    },
+    {
+      "module_id": "MOD-2026-085",
+      "filename": "panel_scan_05.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 4,
+      "module_damage_percentage": 6.7,
+      "cells": [
+        { "index": 4, "row": 0, "col": 4, "is_defective": true, "defect_type": "delamination", "confidence": 0.61 },
+        { "index": 27, "row": 2, "col": 7, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.94 },
+        { "index": 28, "row": 2, "col": 8, "is_defective": true, "defect_type": "dead", "confidence": 0.90 },
+        { "index": 53, "row": 5, "col": 3, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.72 }
+      ]
+    }
+  ]
+}
+</script>
+
+<script src="js/config.js"></script>
+<script src="js/state.js"></script>
+<script src="js/api.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/render.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

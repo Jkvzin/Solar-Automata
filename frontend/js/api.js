@@ -1,0 +1,381 @@
+/**
+ * LuminaPV - API Gateway Communication & Data Ingestion
+ * Handles multipart bulk transmission, stream fallback, retries, CSV export, and payload parsing.
+ */
+
+function isImage(f) {
+  return /\.(png|jpe?g|tiff?|bmp|webp)$/i.test(f.name) || /^image\//.test(f.type);
+}
+
+function isJson(f) {
+  return /\.json$/i.test(f.name) || f.type === "application/json";
+}
+
+function newErrorId(status) {
+  return (status ? ("H" + status) : "NET") + "-" + Date.now().toString(36).toUpperCase().slice(-6);
+}
+
+function describeHttp(status, body) {
+  if (status === 404) {
+    return {
+      title: "Endpoint de análise não encontrado",
+      detail: "A rota " + API_ENDPOINT + " respondeu HTTP 404. Confirme se o serviço de inferência está em execução e se a rota está publicada.",
+      retriable: true
+    };
+  }
+  if (status === 400 || status === 415 || status === 422) {
+    return {
+      title: "Lote rejeitado pela API",
+      detail: "HTTP " + status + " — a API recusou o envio: " + (body ? String(body).slice(0, 240) : "sem detalhe na resposta") + ". Verifique formato e resolução das capturas.",
+      retriable: true
+    };
+  }
+  if (status === 401 || status === 403) {
+    return {
+      title: "Acesso negado pelo serviço de análise",
+      detail: "HTTP " + status + " — a credencial da sessão não autoriza o envio do lote. Renove o acesso e tente novamente.",
+      retriable: false
+    };
+  }
+  if (status >= 500) {
+    return {
+      title: "Falha no serviço de análise",
+      detail: "HTTP " + status + ". O lote foi preservado em memória — tente novamente; se persistir, acione o suporte.",
+      retriable: true
+    };
+  }
+  return {
+    title: "Resposta inesperada da API",
+    detail: "HTTP " + status + " em " + API_ENDPOINT + ". O lote foi preservado — tente novamente.",
+    retriable: true
+  };
+}
+
+function setError(err) {
+  state.errorId = newErrorId(err.status);
+  state.lastAttempt = now();
+  state.lastError = err;
+  state.loading = false;
+  log("error", err.title + " — " + err.detail + " · ID " + state.errorId);
+  renderErrorState(err);
+  renderMetrics();
+  setStatusBar("erro", err.status || "—");
+  live("Falha na análise: " + err.title);
+}
+
+function ingestPayload(data, source) {
+  if (!data || typeof data !== "object") throw new Error("Payload inválido");
+  var modules = Array.isArray(data.modules) ? data.modules : [];
+  var seenIds = {};
+  modules.forEach(function(m, idx) {
+    if (!m.module_id || seenIds[m.module_id]) {
+      m.module_id = (m.module_id ? m.module_id + "_" + pad2(idx + 1) : "MOD-2026-" + pad2(idx + 1));
+    }
+    seenIds[m.module_id] = true;
+  });
+  state.modules = modules;
+  state.summary = data.batch_summary || {};
+  if (!state.summary.total_modules) state.summary.total_modules = modules.length;
+  if (state.summary.defective_modules_count === undefined) {
+    state.summary.defective_modules_count = modules.filter(function(m) { return m.status === "FAIL"; }).length;
+  }
+  var prev = state.activeId;
+  state.activeId = (prev && moduleById(prev)) ? prev : (modules.length ? modules[0].module_id : null);
+  state.selectedCell = null;
+  state.distAnimated = false;
+  state.distValues = null;
+  state.errorId = null;
+  state.loading = false;
+  state.retries = 0;
+  log("ok", "Payload aplicado (" + source + ") · " + modules.length + " módulos · " + int(state.summary.total_modules) + " inspecionados");
+  renderAll();
+  live("Análise recebida. " + modules.length + " módulos carregados no explorador.");
+}
+
+function postBulk(files) {
+  var ctrl = new AbortController();
+  state.controller = ctrl;
+  var fd = new FormData();
+  files.forEach(function(f) { fd.append("files", f, f.name); });
+  var t0 = performance.now();
+  var timedOut = false;
+  var timer = setTimeout(function() { timedOut = true; ctrl.abort(); }, TIMEOUT_MS);
+  var slowTimer = setTimeout(function() {
+    var n = $("#slowNote");
+    if (n) n.hidden = false;
+  }, SLOW_MS);
+  var tick = setInterval(function() {
+    var el = $("#progTime");
+    if (el) el.textContent = ((performance.now() - t0) / 1000).toFixed(1).replace(".", ",") + " s";
+  }, 100);
+
+  function onUpload(frac) {
+    var fill = $("#progFill"), pctEl = $("#progPct");
+    if (fill) fill.style.width = Math.round(frac * 100) + "%";
+    if (pctEl) pctEl.textContent = Math.round(frac * 100) + "%";
+    var ph = $("#progPhase");
+    if (ph) ph.textContent = frac >= 1 ? "AGUARDANDO ANÁLISE" : "UPLINK";
+    var bar = $("#globalBar");
+    if (bar) bar.style.width = Math.max(4, Math.round(frac * 100)) + "%";
+  }
+
+  var body = fd, headers, durationNote = "fetch";
+  try {
+    if (window.ReadableStream && window.Response && new Response(fd).body) {
+      var probe = new Response(fd);
+      var total = Number(probe.headers.get("content-length") || 0);
+      var ctype = probe.headers.get("content-type");
+      var sent = 0;
+      var stream = probe.body.pipeThrough(new TransformStream({
+        transform: function(chunk, ctl) {
+          sent += chunk.byteLength;
+          onUpload(total ? Math.min(sent / total, 1) : 0);
+          ctl.enqueue(chunk);
+        }
+      }));
+      body = stream;
+      headers = { "Content-Type": ctype };
+      durationNote = "fetch (stream com progresso de bytes)";
+    }
+  } catch (e) {
+    body = fd;
+    headers = undefined;
+  }
+
+  log("req", "POST " + API_ENDPOINT + " · " + files.length + " arquivo(s) · " + durationNote + " · timeout " + TIMEOUT_MS / 1000 + " s");
+  setStatusBar("busy");
+
+  function doFetch(useBody, useHeaders) {
+    var opts = { method: "POST", signal: ctrl.signal };
+    if (useHeaders) opts.headers = useHeaders;
+    if (useBody !== fd) opts.duplex = "half";
+    opts.body = useBody;
+    return fetch(API_ENDPOINT, opts);
+  }
+
+  return doFetch(body, headers).catch(function(e) {
+    if (body !== fd) {
+      log("info", "Streaming de upload não suportado pelo navegador — enviando via FormData direto");
+      onUpload(1);
+      return doFetch(fd, undefined);
+    }
+    throw e;
+  }).then(function(res) {
+    clearTimeout(timer);
+    clearTimeout(slowTimer);
+    clearInterval(tick);
+    onUpload(1);
+    var status = res.status;
+    $("#sbHttp").textContent = "HTTP " + status;
+    return res.text().then(function(text) {
+      if (!res.ok) {
+        var d = describeHttp(status, text && text.slice(0, 200));
+        var err = new Error(d.title);
+        err.title = d.title;
+        err.detail = d.detail;
+        err.retriable = d.retriable;
+        err.status = status;
+        throw err;
+      }
+      var data;
+      try {
+        data = JSON.parse(text);
+      } catch (pe) {
+        var e2 = new Error("json");
+        e2.title = "Resposta da API não é JSON válido";
+        e2.detail = "O serviço respondeu HTTP " + status + " mas o corpo não pôde ser interpretado como JSON. Confirme o contrato de resposta do endpoint.";
+        e2.retriable = true;
+        e2.status = status;
+        throw e2;
+      }
+      log("ok", "HTTP " + status + " · resposta recebida em " + ((performance.now() - t0) / 1000).toFixed(2).replace(".", ",") + " s · " + (Array.isArray(data.modules) ? data.modules.length : 0) + " módulos");
+      ingestPayload(data, "HTTP " + status);
+      return data;
+    });
+  }).catch(function(e) {
+    clearTimeout(timer);
+    clearTimeout(slowTimer);
+    clearInterval(tick);
+    if (e && e.status) {
+      setError(e);
+    } else if (timedOut || (e && e.name === "AbortError" && !e.__cancelled)) {
+      setError({
+        title: "Tempo esgotado na análise",
+        detail: "A API não respondeu em " + TIMEOUT_MS / 1000 + " s e a requisição foi cancelada. O lote foi preservado em memória — tente novamente.",
+        retriable: true,
+        status: null
+      });
+    } else if (e && e.name === "AbortError") {
+      log("info", "Requisição cancelada pelo operador");
+      setStatusBar("idle");
+    } else {
+      setError({
+        title: "Serviço de análise inacessível",
+        detail: "Não foi possível alcançar " + API_ENDPOINT + " (" + (e && e.message ? e.message : "erro de rede") + "). Verifique a conexão com o serviço de análise e tente novamente.",
+        retriable: true,
+        status: null
+      });
+    }
+    throw e;
+  });
+}
+
+function ingest(files) {
+  var arr = Array.prototype.slice.call(files || []);
+  if (!arr.length) return;
+  var jsons = arr.filter(isJson);
+  var images = arr.filter(function(f) { return !isJson(f) && isImage(f); });
+  var other = arr.filter(function(f) { return !isJson(f) && !isImage(f); });
+  if (other.length) {
+    log("error", "Ignorados " + other.length + " arquivo(s) fora do contrato: " + other.map(function(f) { return f.name; }).join(", "));
+  }
+  if (jsons.length) {
+    var read = jsons.map(function(f) {
+      return f.text().then(function(t) { return { name: f.name, text: t }; });
+    });
+    Promise.all(read).then(function(items) {
+      items.forEach(function(it) {
+        try {
+          ingestPayload(JSON.parse(it.text), "arquivo local " + it.name);
+        } catch (e) {
+          setError({
+            title: "Payload JSON inválido",
+            detail: "O arquivo " + it.name + " não pôde ser interpretado como payload de diagnóstico. Envie o JSON no contrato de batch_summary + modules[].",
+            retriable: false,
+            status: null
+          });
+        }
+      });
+    });
+  }
+  if (images.length) {
+    state.pendingFiles = images;
+    state.files = images;
+    state.loading = true;
+    state.retries = 0;
+    state.errorId = null;
+    state.startedAt = performance.now();
+    renderMetrics();
+    renderTree();
+    $("#vpState").innerHTML = loadingMarkup();
+    $("#plate").hidden = true;
+    $("#stage").classList.add("no-plate");
+    var cb = $("#cancelBtn");
+    if (cb) cb.addEventListener("click", cancel);
+    live("Analisando " + images.length + " capturas.");
+    postBulk(images).catch(function() {});
+  }
+}
+
+function retry() {
+  if (!state.pendingFiles.length || state.loading) return;
+  state.retries += 1;
+  state.errorId = null;
+  state.loading = true;
+  log("req", "Nova tentativa #" + state.retries + " · " + state.pendingFiles.length + " arquivo(s) preservado(s)");
+  setStatusBar("busy");
+  $("#plate").hidden = true;
+  $("#stage").classList.add("no-plate");
+  $("#vpState").innerHTML = loadingMarkup();
+  var cb = $("#cancelBtn");
+  if (cb) cb.addEventListener("click", cancel);
+  postBulk(state.pendingFiles).catch(function() {});
+}
+
+function cancel() {
+  if (state.controller && state.loading) state.controller.abort();
+  if (state.backoffTimer) { clearInterval(state.backoffTimer); state.backoffTimer = null; }
+  state.loading = false;
+  log("info", "Análise cancelada pelo operador · lote preservado (" + state.pendingFiles.length + " arquivos)");
+  renderAll();
+}
+
+function loadSample() {
+  log("req", "GET " + SAMPLE_PAYLOAD);
+  fetch(SAMPLE_PAYLOAD, { cache: "no-store" }).then(function(r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    $("#sbHttp").textContent = "HTTP " + r.status;
+    return r.json();
+  }).then(function(d) {
+    log("ok", "Payload de exemplo carregado de " + SAMPLE_PAYLOAD);
+    ingestPayload(d, "HTTP GET " + SAMPLE_PAYLOAD);
+  }).catch(function(e) {
+    var inline = document.getElementById("samplePayload");
+    if (inline) {
+      try {
+        var d = JSON.parse(inline.textContent);
+        log("info", "fetch de arquivo indisponível neste contexto — payload de exemplo lido do bloco de dados local");
+        ingestPayload(d, "bloco de dados local");
+        return;
+      } catch (pe) { /* segue para o estado de erro */ }
+    }
+    setError({
+      title: "Payload de exemplo indisponível",
+      detail: "Não foi possível ler " + SAMPLE_PAYLOAD + " (" + (e && e.message ? e.message : "erro") + "). Arraste o arquivo para o explorador ou aponte o console para uma API ativa.",
+      retriable: false,
+      status: null
+    });
+  });
+}
+
+function exportCsv() {
+  if (!state.modules.length) return;
+  var head = ["ID_MODULO", "ARQUIVO", "STATUS", "TOTAL_CELULAS", "CELULAS_DEFEITUOSAS", "DANO_PCT", "TIPOS_DEFEITO", "COORDENADAS_DEFEITUOSAS"];
+  var rows = [head];
+  visibleModules().forEach(function(m) {
+    var dl = defects(m);
+    var types = Array.from(new Set(dl.map(function(c) { return c.defect_type; }))).join(" | ");
+    var coords = dl.map(function(c) { return "R" + pad2(+c.row + 1) + "C" + pad2(+c.col + 1); }).join(" ");
+    rows.push([
+      m.module_id,
+      m.filename || "",
+      m.status || "",
+      m.total_cells || 0,
+      m.defective_cells_count || 0,
+      nf(m.module_damage_percentage, 1),
+      types,
+      coords
+    ]);
+  });
+  rows.push([]);
+  rows.push(["RESUMO_DO_LOTE", "", "", "", "", "", "", ""]);
+  rows.push(["TOTAL_MODULOS", state.summary && state.summary.total_modules || state.modules.length]);
+  rows.push(["MODULOS_DEFEITUOSOS", state.summary && state.summary.defective_modules_count]);
+  rows.push(["TAXA_FALHA_PCT", state.summary && state.summary.batch_failure_percentage]);
+  rows.push(["DEGRADACAO_MEDIA_PCT", state.summary && state.summary.average_cell_degradation_percentage]);
+  rows.push(["EXPORTADO_EM", new Date().toISOString()]);
+  var csv = rows.map(function(r) {
+    return r.map(function(c) { return '"' + String(c === undefined || c === null ? "" : c).replace(/"/g, '""') + '"'; }).join(",");
+  }).join("\r\n");
+  var d = new Date();
+  var name = "luminapv-lote-" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + "-" + pad2(d.getHours()) + pad2(d.getMinutes()) + ".csv";
+  var blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(function() { URL.revokeObjectURL(a.href); }, 4000);
+  log("ok", 'Relatório exportado: ' + name + ' · ' + visibleModules().length + ' linha(s) · coluna de coordenadas incluída');
+}
+
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+
+function fallbackCopy(text) {
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.left = "-1000px";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  ta.remove();
+}

@@ -1,0 +1,313 @@
+"""
+Node 1: API Gateway & Orchestrator Service (FastAPI)
+===================================================
+Author: Principal Distributed Systems Engineer & Senior Computer Vision Architect
+Role:
+- Serves the LuminaPV operator diagnostic console ('luminapv-el-console.html') at GET /
+- Ingests bulk module image uploads via POST /api/v1/analyze/bulk
+- Dispatches parallel HTTP multipart requests to Node 2 (Worker) using httpx.AsyncClient + asyncio.gather
+- Aggregates individual module telemetry into the consolidated batch summary
+- Proxies/serves static fixtures for sample loading
+"""
+
+import asyncio
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import httpx
+from pydantic import BaseModel, Field
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [node1-gateway] %(message)s"
+)
+logger = logging.getLogger("node1_gateway")
+
+WORKER_SERVICE_URL = os.getenv("WORKER_SERVICE_URL", "http://localhost:8001").rstrip("/")
+GATEWAY_TIMEOUT_SECONDS = float(os.getenv("GATEWAY_TIMEOUT_SECONDS", "60.0"))
+
+app = FastAPI(
+    title="LuminaPV API Gateway & Orchestrator (Node 1)",
+    description="Distributed gateway orchestrator dispatching parallel CV tasks to Node 2 worker.",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Determine paths for frontend console and fixtures
+BASE_DIR = Path(__file__).resolve().parent
+
+POSSIBLE_FRONTEND_DIRS = [
+    BASE_DIR / "frontend",
+    BASE_DIR.parent / "frontend",
+    Path("/app/frontend")
+]
+
+POSSIBLE_CONSOLE_PATHS = [
+    BASE_DIR / "luminapv-el-console.html",
+    BASE_DIR.parent / "luminapv-el-console.html",
+    Path("/app/luminapv-el-console.html")
+]
+
+POSSIBLE_FIXTURE_DIRS = [
+    BASE_DIR / "fixtures",
+    BASE_DIR.parent / "fixtures",
+    Path("/app/fixtures")
+]
+
+frontend_dir: Optional[Path] = None
+for fd in POSSIBLE_FRONTEND_DIRS:
+    if (fd / "index.html").is_file():
+        frontend_dir = fd
+        break
+
+console_file_path: Optional[Path] = None
+for p in POSSIBLE_CONSOLE_PATHS:
+    if p.is_file():
+        console_file_path = p
+        break
+
+fixtures_dir_path: Optional[Path] = None
+for f in POSSIBLE_FIXTURE_DIRS:
+    if f.is_dir():
+        fixtures_dir_path = f
+        break
+
+# Mount static frontend assets if available
+if frontend_dir:
+    css_dir = frontend_dir / "css"
+    js_dir = frontend_dir / "js"
+    if css_dir.is_dir():
+        app.mount("/css", StaticFiles(directory=str(css_dir)), name="css")
+    if js_dir.is_dir():
+        app.mount("/js", StaticFiles(directory=str(js_dir)), name="js")
+
+
+# -----------------------------------------------------------------------------
+# Pydantic Contract Models
+# -----------------------------------------------------------------------------
+class BatchSummary(BaseModel):
+    total_modules: int
+    defective_modules_count: int
+    batch_failure_percentage: float
+    average_cell_degradation_percentage: float
+
+
+class BulkAnalysisResponse(BaseModel):
+    batch_summary: BatchSummary
+    modules: List[Dict[str, Any]]
+
+
+# -----------------------------------------------------------------------------
+# Web & Static Asset Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse, tags=["Console Frontend"])
+async def serve_console():
+    """
+    Serves the LuminaPV Optical Diagnostic Console interface.
+    Prioritizes the modular frontend (frontend/index.html), falling back to legacy single-file HTML.
+    """
+    if frontend_dir and (frontend_dir / "index.html").is_file():
+        return FileResponse(frontend_dir / "index.html", media_type="text/html")
+    if console_file_path and console_file_path.is_file():
+        return FileResponse(console_file_path, media_type="text/html")
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="LuminaPV console template not found on server."
+    )
+
+
+@app.get("/legacy", response_class=HTMLResponse, tags=["Console Frontend"])
+async def serve_legacy_console():
+    """
+    Serves the legacy monolithic console ('luminapv-el-console.html') for backwards compatibility.
+    """
+    if console_file_path and console_file_path.is_file():
+        return FileResponse(console_file_path, media_type="text/html")
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Legacy LuminaPV console 'luminapv-el-console.html' not found on server."
+    )
+
+
+@app.get("/fixtures/{filename:path}", tags=["Console Frontend"])
+async def serve_fixture(filename: str):
+    """
+    Serves sample fixtures (e.g. fixtures/luminapv-batch-sample.json).
+    """
+    if fixtures_dir_path:
+        file_path = (fixtures_dir_path / filename).resolve()
+        if file_path.is_file() and file_path.is_relative_to(fixtures_dir_path.resolve()):
+            return FileResponse(file_path, media_type="application/json")
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Fixture file '{filename}' not found."
+    )
+
+
+@app.get("/health", tags=["Telemetry"])
+@app.get("/api/v1/health", tags=["Telemetry"])
+async def health_check():
+    """
+    Gateway health probe and worker connectivity status.
+    """
+    worker_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{WORKER_SERVICE_URL}/health")
+            worker_status = "connected" if resp.status_code == 200 else f"status_{resp.status_code}"
+    except Exception as e:
+        worker_status = f"unreachable ({type(e).__name__})"
+
+    return {
+        "status": "healthy",
+        "service": "node1_gateway",
+        "worker_service_url": WORKER_SERVICE_URL,
+        "worker_connectivity": worker_status
+    }
+
+
+# -----------------------------------------------------------------------------
+# Core Bulk Analysis Orchestrator
+# -----------------------------------------------------------------------------
+async def dispatch_module_to_worker(
+    client: httpx.AsyncClient,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str
+) -> Dict[str, Any]:
+    """
+    Transfers a single raw module image stream to Node 2 worker over internal REST.
+    """
+    url = f"{WORKER_SERVICE_URL}/api/v1/process-module"
+    files = {
+        "file": (filename, file_bytes, content_type or "image/png")
+    }
+
+    try:
+        response = await client.post(url, files=files)
+    except httpx.RequestError as exc:
+        logger.error(f"Network failure calling Node 2 worker at {url} for '{filename}': {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Node 2 worker at {WORKER_SERVICE_URL} is unreachable: {str(exc)}"
+        )
+
+    if response.status_code == 422:
+        # Worker rejected corrupted/unparseable image
+        err_body = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+        logger.warning(f"Node 2 rejected module '{filename}' with HTTP 422: {err_body}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Node 2 unprocessable module for '{filename}': {err_body}"
+        )
+
+    if response.status_code != 200:
+        logger.error(f"Node 2 returned error HTTP {response.status_code} for '{filename}': {response.text}")
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Worker error processing '{filename}': {response.text}"
+        )
+
+    return response.json()
+
+
+@app.post(
+    "/api/v1/analyze/bulk",
+    response_model=BulkAnalysisResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Analysis"],
+    summary="Bulk ingestion and parallel dispatch of photovoltaic module scans"
+)
+async def analyze_bulk(files: List[UploadFile] = File(...)):
+    """
+    Primary ingestion endpoint for the LuminaPV Console.
+    Receives N module images in a single multipart request, dispatches them in
+    parallel to Node 2 via httpx.AsyncClient + asyncio.gather, aggregates telemetry,
+    and returns the consolidated batch summary and module list.
+    """
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files received in multipart request key 'files'."
+        )
+
+    logger.info(f"Initiating parallel bulk analysis for {len(files)} module scans...")
+
+    # Read uploaded files into memory buffers concurrently
+    file_payloads = []
+    for f in files:
+        content = await f.read()
+        file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png"))
+
+    # Dispatch to Node 2 worker concurrently using httpx.AsyncClient
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    timeout = httpx.Timeout(GATEWAY_TIMEOUT_SECONDS, connect=10.0)
+
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+        tasks = [
+            dispatch_module_to_worker(client, content, name, ctype)
+            for content, name, ctype in file_payloads
+        ]
+
+        # Use asyncio.gather to execute all worker requests concurrently
+        modules = await asyncio.gather(*tasks)
+
+    # Ensure every module has a strictly unique module_id across the batch
+    seen_ids = set()
+    for idx, m in enumerate(modules, start=1):
+        mid = m.get("module_id")
+        if not mid or mid in seen_ids:
+            mid = f"MOD-2026-{idx:03d}"
+            m["module_id"] = mid
+        seen_ids.add(mid)
+
+    # Compute batch-wide aggregated telemetry
+    total_modules = len(modules)
+    defective_modules_count = sum(1 for m in modules if m.get("status") == "FAIL")
+
+    batch_failure_percentage = (
+        round((defective_modules_count / float(total_modules)) * 100.0, 1)
+        if total_modules > 0 else 0.0
+    )
+
+    total_damage_sum = sum(float(m.get("module_damage_percentage", 0.0)) for m in modules)
+    average_cell_degradation_percentage = (
+        round(total_damage_sum / float(total_modules), 1)
+        if total_modules > 0 else 0.0
+    )
+
+    batch_summary = BatchSummary(
+        total_modules=total_modules,
+        defective_modules_count=defective_modules_count,
+        batch_failure_percentage=batch_failure_percentage,
+        average_cell_degradation_percentage=average_cell_degradation_percentage
+    )
+
+    logger.info(
+        f"Bulk analysis complete: {total_modules} modules processed, "
+        f"{defective_modules_count} failed ({batch_failure_percentage}%), "
+        f"avg cell degradation: {average_cell_degradation_percentage}%"
+    )
+
+    return BulkAnalysisResponse(
+        batch_summary=batch_summary,
+        modules=modules
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

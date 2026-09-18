@@ -1,0 +1,103 @@
+{
+  "batch_summary": {
+    "total_modules": 5,
+    "defective_modules_count": 3,
+    "batch_failure_percentage": 60.0,
+    "average_cell_degradation_percentage": 10.4
+  },
+  "modules": [
+    {
+      "module_id": "MOD-2026-081",
+      "filename": "panel_scan_01.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 12,
+      "module_damage_percentage": 20.0,
+      "cells": [
+        { "index": 0, "row": 0, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.71 },
+        { "index": 7, "row": 0, "col": 7, "is_defective": true, "defect_type": "dead", "confidence": 0.99 },
+        { "index": 12, "row": 1, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.95 },
+        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.92 },
+        { "index": 20, "row": 2, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.79 },
+        { "index": 23, "row": 2, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.88 },
+        { "index": 30, "row": 3, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.74 },
+        { "index": 35, "row": 3, "col": 5, "is_defective": true, "defect_type": "dead", "confidence": 0.97 },
+        { "index": 47, "row": 4, "col": 7, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.85 },
+        { "index": 48, "row": 4, "col": 8, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.91 },
+        { "index": 51, "row": 5, "col": 1, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.68 },
+        { "index": 59, "row": 5, "col": 9, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.83 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-082",
+      "filename": "panel_scan_02.png",
+      "status": "PASS",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 1,
+      "module_damage_percentage": 1.7,
+      "cells": [
+        { "index": 24, "row": 2, "col": 4, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.62 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-083",
+      "filename": "panel_scan_03.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 12,
+      "total_cells": 72,
+      "defective_cells_count": 17,
+      "module_damage_percentage": 23.6,
+      "cells": [
+        { "index": 1, "row": 0, "col": 1, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.96 },
+        { "index": 2, "row": 0, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.93 },
+        { "index": 11, "row": 0, "col": 11, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.84 },
+        { "index": 12, "row": 1, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.77 },
+        { "index": 14, "row": 1, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.90 },
+        { "index": 23, "row": 1, "col": 11, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.80 },
+        { "index": 24, "row": 2, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.73 },
+        { "index": 25, "row": 2, "col": 1, "is_defective": true, "defect_type": "delamination", "confidence": 0.69 },
+        { "index": 29, "row": 2, "col": 5, "is_defective": true, "defect_type": "dead", "confidence": 0.98 },
+        { "index": 41, "row": 3, "col": 5, "is_defective": true, "defect_type": "dead", "confidence": 0.95 },
+        { "index": 42, "row": 3, "col": 6, "is_defective": true, "defect_type": "dead", "confidence": 0.92 },
+        { "index": 51, "row": 4, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.66 },
+        { "index": 57, "row": 4, "col": 9, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.89 },
+        { "index": 58, "row": 4, "col": 10, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.86 },
+        { "index": 60, "row": 5, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.88 },
+        { "index": 70, "row": 5, "col": 10, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.81 },
+        { "index": 71, "row": 5, "col": 11, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.76 }
+      ]
+    },
+    {
+      "module_id": "MOD-2026-084",
+      "filename": "panel_scan_04.png",
+      "status": "PASS",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 0,
+      "module_damage_percentage": 0.0,
+      "cells": []
+    },
+    {
+      "module_id": "MOD-2026-085",
+      "filename": "panel_scan_05.png",
+      "status": "FAIL",
+      "rows": 6,
+      "cols": 10,
+      "total_cells": 60,
+      "defective_cells_count": 4,
+      "module_damage_percentage": 6.7,
+      "cells": [
+        { "index": 4, "row": 0, "col": 4, "is_defective": true, "defect_type": "delamination", "confidence": 0.61 },
+        { "index": 27, "row": 2, "col": 7, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.94 },
+        { "index": 28, "row": 2, "col": 8, "is_defective": true, "defect_type": "dead", "confidence": 0.90 },
+        { "index": 53, "row": 5, "col": 3, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.72 }
+      ]
+    }
+  ]
+}
