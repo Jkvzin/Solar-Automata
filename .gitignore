@@ -51,6 +51,8 @@ coverage.xml
 *.swp
 *.swo
 *~
+*.save
+*.save.*
 .file-versions/
 .od-skills/
 *.artifact.json
