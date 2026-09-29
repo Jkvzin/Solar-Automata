@@ -9,8 +9,10 @@ Purpose: Performs perspective normalization, dynamic arbitrary grid topology det
 
 import base64
 from enum import Enum
+import logging
 import math
 import os
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,15 +21,19 @@ import numpy as np
 from pydantic import BaseModel, Field
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+from ultralytics import YOLO
+
+logger = logging.getLogger("cv_engine")
 
 
 class DefectType(str, Enum):
+    DEFEITUOSA = "defeituosa"
+    NONE = "none"
     MICRO_CRACK = "micro-crack"
     DEAD = "dead"
     HOT_SPOT = "hot-spot"
     DELAMINATION = "delamination"
     GRID_FAULT = "grid-fault"
-    NONE = "none"
 
 
 class CellBoundingBox(BaseModel):
@@ -310,6 +316,149 @@ def inspect_cell_region(
     return False, DefectType.NONE, round(confidence, 2)
 
 
+# -----------------------------------------------------------------------------
+# YOLOv8-cls Classification Engine (best.pt)
+# -----------------------------------------------------------------------------
+_YOLO_CLASSIFIER: Optional[YOLO] = None
+
+
+def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
+    """
+    Carrega e mantém em cache o modelo YOLOv8-cls (best.pt).
+    Busca no caminho explícito, variável de ambiente MODEL_PATH ou diretórios padrão.
+    """
+    global _YOLO_CLASSIFIER
+    if _YOLO_CLASSIFIER is not None and weights_path is None:
+        return _YOLO_CLASSIFIER
+
+    target_path = weights_path or os.getenv("MODEL_PATH")
+    if not target_path or not os.path.exists(target_path):
+        candidate_paths = [
+            Path(__file__).resolve().parent / "models" / "best.pt",
+            Path(__file__).resolve().parent.parent / "models" / "best.pt",
+            Path(__file__).resolve().parent.parent / "weights" / "best.pt",
+            Path(__file__).resolve().parent.parent / "model" / "best.pt",
+            Path("models/best.pt"),
+            Path("weights/best.pt"),
+            Path("model/best.pt"),
+        ]
+        for p in candidate_paths:
+            if p.is_file():
+                target_path = str(p)
+                break
+
+    if not target_path or not os.path.exists(target_path):
+        raise FileNotFoundError(
+            f"Arquivo de pesos 'best.pt' não encontrado nos caminhos padrão."
+        )
+
+    logger.info(f"Carregando modelo YOLOv8-cls a partir de: {target_path}")
+    _YOLO_CLASSIFIER = YOLO(target_path)
+    return _YOLO_CLASSIFIER
+
+
+def classify_cell_yolo(
+    cell_crop: np.ndarray,
+    model: Optional[YOLO] = None
+) -> Tuple[bool, DefectType, float]:
+    """
+    Classifica uma célula solar cortada (crop) utilizando a API de classificação YOLOv8-cls.
+    Extrai:
+      - Predição da classe: results[0].names[results[0].probs.top1]
+      - Confiança: float(results[0].probs.top1conf)
+
+    Retorna:
+      Tuple[bool, DefectType, float]: (is_defective, defect_type, confidence)
+    """
+    if model is None:
+        model = get_yolo_classifier()
+
+    # Formatar o crop para 3 canais (BGR) exigido pela rede
+    if len(cell_crop.shape) == 2:
+        cell_input = cv2.cvtColor(cell_crop, cv2.COLOR_GRAY2BGR)
+    elif cell_crop.shape[2] == 4:
+        cell_input = cv2.cvtColor(cell_crop, cv2.COLOR_BGRA2BGR)
+    else:
+        cell_input = cell_crop
+
+    # Inferência Ultralytics YOLOv8-cls
+    results = model(cell_input, verbose=False)
+    probs = results[0].probs
+    top1_idx = probs.top1
+    pred_label = str(results[0].names[top1_idx]).strip().lower()
+    confidence = float(probs.top1conf)
+
+    # Identificação da classe: 'boa' vs 'defeituosa'
+    is_defective = (pred_label in ["defeituosa", "defeito", "defect", "defective"])
+    defect_type = DefectType.DEFEITUOSA if is_defective else DefectType.NONE
+
+    return is_defective, defect_type, round(confidence, 4)
+
+
+def draw_defect_annotations(
+    image: np.ndarray,
+    cells: List[CellInspection],
+    highlight_color: Tuple[int, int, int] = (0, 0, 255),  # Vermelho BGR para defeituosas
+    box_thickness: int = 2,
+    draw_banner: bool = False
+) -> np.ndarray:
+    """
+    Desenha retângulos visuais de destaque demarcando as células defeituosas
+    e adiciona um overlay translúcido para rápida identificação visual.
+    """
+    annotated = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if len(image.shape) == 2 else image.copy()
+    overlay = annotated.copy()
+
+    defective_cells = [c for c in cells if c.is_defective and c.bbox]
+
+    # Preenchimento translúcido das células com defeito
+    for cell in defective_cells:
+        bbox = cell.bbox
+        cv2.rectangle(
+            overlay,
+            (bbox.x, bbox.y),
+            (bbox.x + bbox.width, bbox.y + bbox.height),
+            highlight_color,
+            -1
+        )
+
+    # Mescla o preenchimento com 25% de opacidade
+    cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
+
+    # Contorno sólido e rótulo de confiança
+    for cell in defective_cells:
+        bbox = cell.bbox
+        x, y, w, h = bbox.x, bbox.y, bbox.width, bbox.height
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), highlight_color, box_thickness)
+
+        label = f"{cell.confidence:.0%}"
+        font_scale = max(0.35, min(w, h) / 130.0)
+        cv2.putText(
+            annotated,
+            label,
+            (x + 4, y + max(12, int(14 * (font_scale / 0.35)))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            highlight_color,
+            1,
+            cv2.LINE_AA
+        )
+
+    if draw_banner:
+        total = len(cells)
+        defective = len(defective_cells)
+        damage_pct = round((defective / float(total)) * 100.0, 1) if total > 0 else 0.0
+        status_text = "REPROVADO (FAIL)" if damage_pct >= 5.0 else "APROVADO (PASS)"
+
+        banner_h = 36
+        banner = np.zeros((banner_h, annotated.shape[1], 3), dtype=np.uint8)
+        header_text = f"Dano: {damage_pct:.1f}% ({defective}/{total} defeituosas) | Status: {status_text}"
+        cv2.putText(banner, header_text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        annotated = np.vstack([banner, annotated])
+
+    return annotated
+
+
 def generate_module_id(filename: str, fallback_idx: int = 1) -> str:
     """
     Generates or extracts a standardized module ID (e.g. MOD-2026-001).
@@ -329,15 +478,22 @@ def generate_module_id(filename: str, fallback_idx: int = 1) -> str:
     return f"MOD-2026-{h:03d}"
 
 
-def evaluate_module(image_bytes: bytes, filename: str, fallback_idx: int = 1) -> ModuleResult:
+def evaluate_module(
+    image_bytes: bytes,
+    filename: str,
+    fallback_idx: int = 1,
+    use_yolo: bool = True,
+    model: Optional[YOLO] = None
+) -> ModuleResult:
     """
     Complete end-to-end computer vision processing pipeline for a single PV module:
     1. Memory decoding & validation
     2. Perspective normalization (homography rectification)
     3. Dynamic grid topology detection (arbitrary R rows x C cols)
     4. In-memory cell slicing (R*C sub-arrays)
-    5. Luminescence defect inspection per cell
+    5. YOLOv8-cls classification per cell (best.pt)
     6. Module damage % computation and FAIL/PASS classification
+    7. Visual reconstruction with defect bounding boxes
     """
     if not image_bytes or len(image_bytes) < 32:
         raise ValueError("Empty or corrupted image byte stream.")
@@ -350,11 +506,6 @@ def evaluate_module(image_bytes: bytes, filename: str, fallback_idx: int = 1) ->
     # 1. Perspective Normalization
     rectified = normalize_perspective(img)
     h, w = rectified.shape[:2]
-    was_transformed = (rectified.shape != img.shape) or not np.array_equal(rectified, img)
-    rectified_image = None
-    if was_transformed:
-        _, buf = cv2.imencode('.jpg', rectified, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        rectified_image = f"data:image/jpeg;base64,{base64.b64encode(buf).decode('ascii')}"
 
     # 2. Dynamic Grid Topology Detection (R rows x C cols)
     rows, cols, y_bounds, x_bounds = detect_grid_topology(rectified)
@@ -375,13 +526,23 @@ def evaluate_module(image_bytes: bytes, filename: str, fallback_idx: int = 1) ->
         "height_pct": round(((y_end - y_start) / float(h)) * 100.0, 2)
     }
 
-    # Compute baseline module luminescence statistics across the active surface
+    # Baseline statistics for fallback heuristic
     module_median_int = float(np.median(rectified))
     module_std_int = float(np.std(rectified))
 
-    # 3. In-Memory Cell Slicing and Inspection
+    # 3. In-Memory Cell Slicing and YOLOv8-cls Inspection
     cells: List[CellInspection] = []
     defective_count = 0
+    yolo_model: Optional[YOLO] = model
+
+    if use_yolo and yolo_model is None:
+        try:
+            yolo_model = get_yolo_classifier()
+        except Exception as exc:
+            logger.warning(
+                f"YOLOv8-cls model could not be loaded ({exc}). Falling back to heuristic inspection."
+            )
+            yolo_model = None
 
     for r in range(rows):
         y0, y1 = y_bounds[r], y_bounds[r + 1]
@@ -392,11 +553,17 @@ def evaluate_module(image_bytes: bytes, filename: str, fallback_idx: int = 1) ->
             # Slice sub-array directly in memory (zero disk I/O)
             cell_img = rectified[y0:y1, x0:x1]
 
-            is_defective, defect_type, confidence = inspect_cell_region(
-                cell_img,
-                module_median_int,
-                module_std_int
-            )
+            if yolo_model is not None:
+                is_defective, defect_type, confidence = classify_cell_yolo(
+                    cell_img,
+                    model=yolo_model
+                )
+            else:
+                is_defective, defect_type, confidence = inspect_cell_region(
+                    cell_img,
+                    module_median_int,
+                    module_std_int
+                )
 
             if is_defective:
                 defective_count += 1
@@ -430,6 +597,11 @@ def evaluate_module(image_bytes: bytes, filename: str, fallback_idx: int = 1) ->
     module_damage_pct = round((defective_count / float(total_cells)) * 100.0, 1) if total_cells > 0 else 0.0
     status = "FAIL" if module_damage_pct >= 5.0 else "PASS"
     module_id = generate_module_id(filename, fallback_idx)
+
+    # Reconstructed / visual raster with bounding boxes highlighting defective cells
+    annotated_panel = draw_defect_annotations(rectified, cells, draw_banner=False)
+    _, buf = cv2.imencode('.jpg', annotated_panel, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    rectified_image = f"data:image/jpeg;base64,{base64.b64encode(buf).decode('ascii')}"
 
     return ModuleResult(
         module_id=module_id,

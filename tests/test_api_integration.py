@@ -34,6 +34,14 @@ class TestDistributedAPIIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixtures_dir = ROOT_DIR / "tests" / "fixtures"
+        # Mock AWS S3 & SQS clients to prevent network calls/timeouts in test environments
+        patcher_s3 = patch.object(gateway_module, "s3_client")
+        patcher_sqs = patch.object(gateway_module, "sqs_client")
+        cls.mock_s3 = patcher_s3.start()
+        cls.mock_sqs = patcher_sqs.start()
+        cls.addClassCleanup(patcher_s3.stop)
+        cls.addClassCleanup(patcher_sqs.stop)
+
         cls.worker_client = TestClient(worker_app)
         cls.gateway_client = TestClient(gateway_app)
 
@@ -54,7 +62,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         with open(img_path, "rb") as f:
             files = {"file": ("scan_module_6x10_pass.png", f.read(), "image/png")}
 
-        response = self.worker_client.post("/api/v1/process-module", files=files)
+        response = self.worker_client.post("/api/v1/process-module?use_yolo=false", files=files)
         self.assertEqual(response.status_code, 200)
         data = response.json()
 
@@ -193,9 +201,9 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             f2_bytes = f2.read()
 
         async def direct_worker_dispatch(client, file_bytes, filename, content_type):
-            # Call worker app directly in-memory
+            # Call worker app directly in-memory with deterministic heuristic for synthetic fixtures
             from cv_engine import evaluate_module
-            res = evaluate_module(file_bytes, filename=filename)
+            res = evaluate_module(file_bytes, filename=filename, use_yolo=False)
             return json.loads(res.model_dump_json())
 
         with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=direct_worker_dispatch):

@@ -71,14 +71,17 @@ async def health_check():
     tags=["Computer Vision"],
     summary="Process a single full-size solar module EL image"
 )
-async def process_module(file: UploadFile = File(...)):
+async def process_module(
+    file: UploadFile = File(...),
+    use_yolo: bool = True
+):
     """
     Accepts raw module image binary via multipart/form-data.
     Performs perspective rectification, dynamic grid topology estimation,
     in-memory cell slicing, and luminescence defect classification.
     """
     filename = file.filename or "module_scan.png"
-    logger.info(f"Received module inspection request for: '{filename}' (type: {file.content_type})")
+    logger.info(f"Received module inspection request for: '{filename}' (type: {file.content_type}, use_yolo={use_yolo})")
 
     try:
         image_bytes = await file.read()
@@ -98,7 +101,7 @@ async def process_module(file: UploadFile = File(...)):
 
     try:
         # Run computer vision evaluation pipeline
-        result = evaluate_module(image_bytes, filename=filename)
+        result = evaluate_module(image_bytes, filename=filename, use_yolo=use_yolo)
         logger.info(
             f"Successfully processed '{filename}': Grid={result.rows}x{result.cols}, "
             f"TotalCells={result.total_cells}, Defective={result.defective_cells_count}, "

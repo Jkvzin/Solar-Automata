@@ -19,7 +19,10 @@ from cv_engine import (
     evaluate_module,
     normalize_perspective,
     detect_grid_topology,
-    inspect_cell_region
+    inspect_cell_region,
+    classify_cell_yolo,
+    draw_defect_annotations,
+    get_yolo_classifier
 )
 
 
@@ -44,7 +47,7 @@ class TestCVEngine(unittest.TestCase):
         with open(img_path, "rb") as f:
             data = f.read()
 
-        result = evaluate_module(data, filename="scan_module_6x10_pass.png")
+        result = evaluate_module(data, filename="scan_module_6x10_pass.png", use_yolo=False)
 
         self.assertEqual(result.rows, 6)
         self.assertEqual(result.cols, 10)
@@ -102,11 +105,49 @@ class TestCVEngine(unittest.TestCase):
         with open(img_path, "rb") as f:
             data = f.read()
 
-        result = evaluate_module(data, filename="scan_module_tilted_6x10.png")
+        result = evaluate_module(data, filename="scan_module_tilted_6x10.png", use_yolo=False)
         # Should rectify and resolve the grid
         self.assertEqual(result.rows, 6)
         self.assertEqual(result.cols, 10)
         self.assertEqual(result.total_cells, 60)
+
+    def test_yolo_classifier_loading_and_inference(self):
+        """Verify YOLOv8-cls model loads and classifies cell crops correctly."""
+        model = get_yolo_classifier()
+        self.assertIsNotNone(model)
+        self.assertEqual(model.task, "classify")
+        self.assertIn("boa", model.names.values())
+        self.assertIn("defeituosa", model.names.values())
+
+        # Test inference on a 64x64 cell crop
+        dummy_cell = np.full((64, 64), 180, dtype=np.uint8)
+        is_defective, defect_type, confidence = classify_cell_yolo(dummy_cell, model=model)
+        self.assertIsInstance(is_defective, bool)
+        self.assertIsInstance(defect_type, DefectType)
+        self.assertGreaterEqual(confidence, 0.0)
+        self.assertLessEqual(confidence, 1.0)
+
+    def test_draw_defect_annotations(self):
+        """Verify drawing bounding boxes on defective cells."""
+        img = np.full((200, 200, 3), 128, dtype=np.uint8)
+        from cv_engine import CellInspection, CellBoundingBox
+        cells = [
+            CellInspection(
+                index=0, row=0, col=0, is_defective=True,
+                defect_type=DefectType.DEFEITUOSA, confidence=0.92,
+                bbox=CellBoundingBox(x=10, y=10, width=80, height=80, x_pct=5.0, y_pct=5.0, width_pct=40.0, height_pct=40.0)
+            ),
+            CellInspection(
+                index=1, row=0, col=1, is_defective=False,
+                defect_type=DefectType.NONE, confidence=0.98,
+                bbox=CellBoundingBox(x=100, y=10, width=80, height=80, x_pct=50.0, y_pct=5.0, width_pct=40.0, height_pct=40.0)
+            )
+        ]
+        annotated = draw_defect_annotations(img, cells, draw_banner=True)
+        self.assertIsNotNone(annotated)
+        self.assertEqual(len(annotated.shape), 3)
+        # Should have banner height added
+        self.assertGreater(annotated.shape[0], 200)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
+# Copy application source code and models
 COPY cv_engine.py main.py ./
+COPY models/ ./models/
 
 # Expose port
 ENV PORT=8001

@@ -63,3 +63,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Internal context & documentation (not tracked on GitHub)
+contexto*
+[Cc]ontexto*
+resultado_painel*.png
+
