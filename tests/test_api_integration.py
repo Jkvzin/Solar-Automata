@@ -417,6 +417,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_gateway_bulk_analysis_aws_failure_resilience(self):
         """Gateway analyze_bulk does not fail with HTTP 500 if AWS S3/SQS encounters an error."""
+        # Force mock S3 and SQS to raise exceptions to simulate missing AWS credentials / network outage
         self.mock_s3.upload_fileobj.side_effect = Exception("AWS Access Denied / Invalid Credentials")
         self.mock_sqs.send_message.side_effect = Exception("AWS SQS Unreachable")
 
@@ -440,13 +441,151 @@ class TestDistributedAPIIntegration(unittest.TestCase):
 
         with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=dummy_worker_dispatch):
             files = [("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png"))]
+            # Should succeed with HTTP 200, safely catching the AWS error
             response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
             self.assertEqual(response.status_code, 200)
             data = response.json()
             self.assertEqual(data["batch_summary"]["total_modules"], 1)
 
+        # Reset mocks side effect for subsequent tests
         self.mock_s3.upload_fileobj.side_effect = None
         self.mock_sqs.send_message.side_effect = None
+
+    # -------------------------------------------------------------------------
+    # Issue #4: Dynamic Name Resolution, Load Balancing & Failover Tests
+    # -------------------------------------------------------------------------
+    def test_service_catalog_resolver_dynamic_names(self):
+        """ServiceCatalogResolver resolves logical service name to active healthy endpoints from Redis."""
+        mock_redis = AsyncMock()
+        mock_redis.smembers.return_value = {"worker-1", "worker-2"}
+        node1_data = json.dumps({
+            "node_id": "worker-1",
+            "endpoint": "http://worker-1.luminapv.local:8001",
+            "status": "ONLINE",
+            "role": "LEADER"
+        })
+        node2_data = json.dumps({
+            "node_id": "worker-2",
+            "endpoint": "http://worker-2.luminapv.local:8002",
+            "status": "ONLINE",
+            "role": "FOLLOWER"
+        })
+        mock_redis.get.side_effect = lambda key: node1_data if "worker-1" in key else node2_data
+
+        resolver = gateway_module.ServiceCatalogResolver(
+            redis_url="redis://localhost:6379",
+            default_url="http://localhost:8001",
+            service_name="service://luminapv-vision-worker"
+        )
+        resolver.redis_client = mock_redis
+
+        endpoints = asyncio.run(resolver.get_healthy_endpoints())
+        self.assertEqual(len(endpoints), 2)
+        self.assertIn("http://worker-1.luminapv.local:8001", endpoints)
+        self.assertIn("http://worker-2.luminapv.local:8002", endpoints)
+
+    def test_gateway_automatic_failover(self):
+        """dispatch_module_to_worker performs automatic failover if the primary worker is unreachable."""
+        calls = []
+
+        async def mock_post(url, files):
+            calls.append(url)
+            if "worker-1" in url:
+                # Primary fails with connection error
+                raise httpx.ConnectError("Connection refused to worker-1")
+            # Failover worker succeeds
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "module_id": "MOD-FAILOVER",
+                "filename": "scan.png",
+                "status": "PASS",
+                "processed_by_node": "worker-2"
+            }
+            return mock_resp
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = mock_post
+
+        result = asyncio.run(gateway_module.dispatch_module_to_worker(
+            client=mock_client,
+            file_bytes=b"fake_bytes",
+            filename="scan.png",
+            content_type="image/png",
+            target_worker_url="http://worker-1.luminapv.local:8001",
+            candidate_worker_urls=["http://worker-1.luminapv.local:8001", "http://worker-2.luminapv.local:8002"]
+        ))
+
+        self.assertEqual(result["module_id"], "MOD-FAILOVER")
+        self.assertEqual(result["processed_by_node"], "worker-2")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("worker-1.luminapv.local:8001", calls[0])
+        self.assertIn("worker-2.luminapv.local:8002", calls[1])
+
+    def test_gateway_round_robin_balancing(self):
+        """analyze_bulk balances module requests across workers in Round-Robin order."""
+        dispatched_targets = []
+
+        async def tracking_dispatch(client, file_bytes, filename, content_type, target_worker_url=None, candidate_worker_urls=None):
+            dispatched_targets.append(target_worker_url)
+            return {
+                "module_id": f"MOD-{filename}",
+                "filename": filename,
+                "status": "PASS",
+                "rows": 6,
+                "cols": 10,
+                "total_cells": 60,
+                "defective_cells_count": 0,
+                "module_damage_percentage": 0.0,
+                "processed_by_node": "worker",
+                "cells": []
+            }
+
+        # Mock resolver to return two workers
+        with patch.object(
+            gateway_module.resolver,
+            "get_healthy_endpoints",
+            AsyncMock(return_value=["http://worker-1:8001", "http://worker-2:8002"])
+        ):
+            with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=tracking_dispatch):
+                files = [
+                    ("files", ("scan_a.png", b"bytes_a", "image/png")),
+                    ("files", ("scan_b.png", b"bytes_b", "image/png")),
+                    ("files", ("scan_c.png", b"bytes_c", "image/png")),
+                    ("files", ("scan_d.png", b"bytes_d", "image/png"))
+                ]
+                gateway_module.resolver.rr_index = 0
+                resp = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+                self.assertEqual(resp.status_code, 200)
+
+                # Expect alternating Round-Robin assignment
+                self.assertEqual(len(dispatched_targets), 4)
+                self.assertEqual(dispatched_targets[0], "http://worker-1:8001")
+                self.assertEqual(dispatched_targets[1], "http://worker-2:8002")
+                self.assertEqual(dispatched_targets[2], "http://worker-1:8001")
+                self.assertEqual(dispatched_targets[3], "http://worker-2:8002")
+
+    # -------------------------------------------------------------------------
+    # Issue #4: Cluster Telemetry Endpoint Tests
+    # -------------------------------------------------------------------------
+    def test_gateway_cluster_status_endpoint(self):
+        """Gateway GET /api/v1/cluster/status exposes complete distributed telemetry."""
+        response = self.gateway_client.get("/api/v1/cluster/status")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(data["status"], "healthy")
+        self.assertIn("leader_id", data)
+        self.assertIn("term", data)
+        self.assertIn("naming_scheme", data)
+        self.assertEqual(data["naming_scheme"]["service_name"], "service://luminapv-vision-worker")
+        self.assertEqual(data["naming_scheme"]["dns_domain"], "luminapv.local")
+        self.assertIn("consistency_model", data)
+        self.assertIn("nodes", data)
+        self.assertIsInstance(data["nodes"], list)
+        self.assertIn("active_locks", data)
+        self.assertIsInstance(data["active_locks"], list)
+        self.assertIn("replication_stats", data)
 
     def test_gateway_cluster_election_endpoint(self):
         """Gateway POST /api/v1/cluster/election triggers re-election simulation."""

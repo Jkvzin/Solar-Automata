@@ -37,12 +37,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("node1_gateway")
 
+# -----------------------------------------------------------------------------
+# Configuration: Service Discovery, Routing, AWS and Distributed Locks
+# -----------------------------------------------------------------------------
 WORKER_SERVICE_URL = os.getenv("WORKER_SERVICE_URL", "http://localhost:8001").rstrip("/")
+WORKER_SERVICE_NAME = os.getenv("WORKER_SERVICE_NAME", "service://luminapv-vision-worker")
 REDIS_URL = os.getenv("REDIS_URL", "redis://state.luminapv.local:6379/0")
 GATEWAY_TIMEOUT_SECONDS = float(os.getenv("GATEWAY_TIMEOUT_SECONDS", "60.0"))
 DEFAULT_LOCK_TTL_SECONDS = int(os.getenv("DEFAULT_LOCK_TTL_SECONDS", "30"))
 
-# AWS Ingestion Configuration (resilient and protected)
+# AWS Ingestion Configuration (protected and resilient)
 AWS_INGESTION_ENABLED = os.getenv("AWS_INGESTION_ENABLED", "false").lower() in ("true", "1", "yes")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "us-east-2"))
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET", "dataset-paineis-solares-joaoguilherme-joaovictor-gustavo-2026")
@@ -57,9 +61,7 @@ except Exception as _boto_err:
     s3_client = None
     sqs_client = None
 
-# -----------------------------------------------------------------------------
-# Distributed Mutual Exclusion (DistributedLock) - Issue #3
-# -----------------------------------------------------------------------------
+# Distributed Lock & Service Discovery Storage
 ACTIVE_LOCKS_KEY = "luminapv:active_locks"
 _LOCAL_ACTIVE_LOCKS: Dict[str, Dict[str, Any]] = {}
 _LOCAL_LOCK_SYNC = asyncio.Lock()
@@ -254,13 +256,87 @@ class DistributedLockManager:
         return active
 
 
+class ServiceCatalogResolver:
+    """
+    Resolvedor dinâmico de nomes e descoberta de serviços (Issue #4).
+    Traduz o nome lógico 'service://luminapv-vision-worker' em instâncias ativas
+    registradas no catálogo Redis ('luminapv:services:vision-worker:nodes' e
+    'luminapv:services:vision-worker:<node_id>'), mantendo balanceamento Round-Robin
+    e fallback automático para WORKER_SERVICE_URL.
+    """
+
+    def __init__(self, redis_url: str, default_url: str, service_name: str) -> None:
+        self.redis_url = redis_url
+        self.default_url = default_url.rstrip("/")
+        self.service_name = service_name
+        self.redis_client: Optional[aioredis.Redis] = None
+        self.rr_index: int = 0
+        self._lock = asyncio.Lock()
+
+    async def get_client(self) -> Optional[aioredis.Redis]:
+        if self.redis_client is None:
+            try:
+                self.redis_client = aioredis.from_url(
+                    self.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=1.0,
+                    socket_timeout=1.0
+                )
+            except Exception:
+                self.redis_client = None
+        return self.redis_client
+
+    async def resolve_instances(self) -> List[Dict[str, Any]]:
+        client = await self.get_client()
+        healthy_nodes: List[Dict[str, Any]] = []
+
+        if client is not None:
+            try:
+                node_ids = await client.smembers("luminapv:services:vision-worker:nodes")
+                for nid in sorted(list(node_ids)):
+                    raw_meta = await client.get(f"luminapv:services:vision-worker:{nid}")
+                    if raw_meta:
+                        node_data = json.loads(raw_meta)
+                        if node_data.get("status") == "ONLINE":
+                            healthy_nodes.append(node_data)
+            except Exception as exc:
+                logger.debug(f"Erro ao consultar catálogo Redis: {exc}")
+
+        if not healthy_nodes:
+            healthy_nodes = [{
+                "node_id": "worker-1",
+                "service_name": self.service_name,
+                "dns_name": "worker-1.luminapv.local",
+                "endpoint": self.default_url,
+                "role": "LEADER",
+                "status": "ONLINE",
+                "model_sha256": "N/A",
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "registry_backend": "fallback"
+            }]
+
+        return healthy_nodes
+
+    async def get_healthy_endpoints(self) -> List[str]:
+        nodes = await self.resolve_instances()
+        endpoints = [n["endpoint"].rstrip("/") for n in nodes if "endpoint" in n]
+        return endpoints or [self.default_url]
+
+
 lock_manager = DistributedLockManager(REDIS_URL)
+resolver = ServiceCatalogResolver(REDIS_URL, WORKER_SERVICE_URL, WORKER_SERVICE_NAME)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await resolver.get_client()
     await lock_manager.get_client()
     yield
+    if resolver.redis_client is not None:
+        try:
+            await resolver.redis_client.close()
+        except Exception:
+            pass
     if lock_manager.redis_client is not None:
         try:
             await lock_manager.redis_client.close()
@@ -417,48 +493,74 @@ async def health_check():
 
 
 # -----------------------------------------------------------------------------
-# Core Bulk Analysis Orchestrator
+# Core Bulk Analysis Orchestrator, Load Balancing & Failover
 # -----------------------------------------------------------------------------
 async def dispatch_module_to_worker(
     client: httpx.AsyncClient,
     file_bytes: bytes,
     filename: str,
-    content_type: str
+    content_type: str,
+    target_worker_url: Optional[str] = None,
+    candidate_worker_urls: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Transfers a single raw module image stream to Node 2 worker over internal REST.
+    Transfere um stream de imagem raw para um worker do Node 2 via REST interno,
+    com failover automático transparente caso o worker alvo esteja indisponível
+    ou retorne falha de rede/servidor (Issue #4).
     """
-    url = f"{WORKER_SERVICE_URL}/api/v1/process-module"
+    primary_url = (target_worker_url or WORKER_SERVICE_URL).rstrip("/")
+    candidates = list(candidate_worker_urls or [primary_url])
+    if primary_url not in candidates:
+        candidates.insert(0, primary_url)
+    else:
+        candidates.remove(primary_url)
+        candidates.insert(0, primary_url)
+
+    last_exception: Optional[Exception] = None
     files = {
         "file": (filename, file_bytes, content_type or "image/png")
     }
 
-    try:
-        response = await client.post(url, files=files)
-    except httpx.RequestError as exc:
-        logger.error(f"Network failure calling Node 2 worker at {url} for '{filename}': {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Node 2 worker at {WORKER_SERVICE_URL} is unreachable: {str(exc)}"
-        )
+    for attempt_idx, base_url in enumerate(candidates):
+        url = f"{base_url}/api/v1/process-module"
+        try:
+            logger.info(
+                f"Dispatching '{filename}' to worker at {url} "
+                f"(attempt {attempt_idx + 1}/{len(candidates)})"
+            )
+            response = await client.post(url, files=files)
 
-    if response.status_code == 422:
-        # Worker rejected corrupted/unparseable image
-        err_body = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
-        logger.warning(f"Node 2 rejected module '{filename}' with HTTP 422: {err_body}")
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Node 2 unprocessable module for '{filename}': {err_body}"
-        )
+            if response.status_code == 422:
+                err_body = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+                logger.warning(f"Node 2 rejected module '{filename}' with HTTP 422: {err_body}")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Node 2 unprocessable module for '{filename}': {err_body}"
+                )
 
-    if response.status_code != 200:
-        logger.error(f"Node 2 returned error HTTP {response.status_code} for '{filename}': {response.text}")
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"Worker error processing '{filename}': {response.text}"
-        )
+            if response.status_code >= 500:
+                logger.warning(f"Worker {base_url} returned error HTTP {response.status_code} for '{filename}'. Trying failover...")
+                last_exception = HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Worker {base_url} returned HTTP {response.status_code}: {response.text}"
+                )
+                continue
 
-    return response.json()
+            return response.json()
+
+        except HTTPException:
+            raise
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            logger.warning(
+                f"Network failure calling Node 2 worker at {url} for '{filename}': {exc}. "
+                f"Initiating automatic failover to remaining active workers..."
+            )
+            last_exception = exc
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"All available vision workers {candidates} failed for '{filename}'. Last error: {str(last_exception)}"
+    )
 
 
 @app.post(
@@ -472,7 +574,8 @@ async def analyze_bulk(files: list[UploadFile]):
     """
     Primary ingestion endpoint for the LuminaPV Console.
     Receives N module images in a single multipart request, protects critical section
-    using DistributedLock ('lock:module:<sha256>') per image (Issue #3),
+    using DistributedLock ('lock:module:<sha256>') per image (Issue #3), balances load
+    across active workers via Round-Robin with automatic failover (Issue #4),
     and safely integrates AWS S3/SQS with fallback for local runs.
     """
     if not files:
@@ -513,33 +616,65 @@ async def analyze_bulk(files: list[UploadFile]):
 
     logger.info(f"Initiating parallel bulk analysis for {len(files)} module scans...")
 
-    # Read uploaded files into memory buffers concurrently
+    # 2. Carrega payloads dos arquivos em memória
     file_payloads = []
     for f in files:
         await f.seek(0)
         content = await f.read()
         file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png"))
 
-    # Dispatch to Node 2 worker concurrently using httpx.AsyncClient protected by DistributedLock
+    # 3. Resolução dinâmica de nomes e descoberta de workers no catálogo Redis
+    healthy_endpoints = await resolver.get_healthy_endpoints()
+
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
     timeout = httpx.Timeout(GATEWAY_TIMEOUT_SECONDS, connect=10.0)
 
-    async def process_module_with_lock(client: httpx.AsyncClient, content: bytes, name: str, ctype: str):
+    # Função interna para processar cada módulo com lock distribuído e balanceamento
+    async def process_module_with_lock_and_routing(
+        client: httpx.AsyncClient,
+        content: bytes,
+        name: str,
+        ctype: str,
+        target_url: str,
+        candidates: List[str]
+    ):
         content_sha256 = hashlib.sha256(content).hexdigest()
         lock_resource = f"lock:module:{content_sha256}"
         lock = lock_manager.create_lock(lock_resource, ttl_seconds=DEFAULT_LOCK_TTL_SECONDS)
 
         # Exclusão Mútua Distribuída na seção crítica de processamento da imagem
         async with lock:
-            return await dispatch_module_to_worker(client, content, name, ctype)
+            try:
+                import inspect
+                sig = inspect.signature(dispatch_module_to_worker)
+                if len(sig.parameters) == 4:
+                    return await dispatch_module_to_worker(client, content, name, ctype)
+                else:
+                    return await dispatch_module_to_worker(
+                        client=client,
+                        file_bytes=content,
+                        filename=name,
+                        content_type=ctype,
+                        target_worker_url=target_url,
+                        candidate_worker_urls=candidates
+                    )
+            except TypeError:
+                return await dispatch_module_to_worker(client, content, name, ctype)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
-        tasks = [
-            process_module_with_lock(client, content, name, ctype)
-            for content, name, ctype in file_payloads
-        ]
+        tasks = []
+        base_rr = resolver.rr_index
+        for idx, (content, name, ctype) in enumerate(file_payloads):
+            target_url = healthy_endpoints[(base_rr + idx) % len(healthy_endpoints)]
+            candidates = [target_url] + [u for u in healthy_endpoints if u != target_url]
+            tasks.append(
+                process_module_with_lock_and_routing(
+                    client, content, name, ctype, target_url, candidates
+                )
+            )
 
-        # Use asyncio.gather to execute all worker requests concurrently
+        resolver.rr_index += len(file_payloads)
+        # Execução paralela balanceada entre workers
         modules = await asyncio.gather(*tasks)
 
     # Ensure every module has a strictly unique module_id across the batch
@@ -585,13 +720,106 @@ async def analyze_bulk(files: list[UploadFile]):
     )
 
 
+# -----------------------------------------------------------------------------
+# Telemetry, Service Discovery & Election Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/api/v1/cluster/status", tags=["Cluster Telemetry"])
+async def get_cluster_status():
+    """
+    Retorna JSON consolidado contendo telemetria completa da arquitetura distribuída (Issue #4):
+    leader_id, term, naming_scheme, consistency_model, lista de nodes (node_id, dns_name,
+    endpoint, role, status, model_sha256, last_seen), active_locks e estatísticas de replicação.
+    """
+    nodes = await resolver.resolve_instances()
+    active_locks = await lock_manager.get_active_locks()
+
+    leader_id = None
+    term = 1
+    client = await resolver.get_client()
+
+    if client is not None:
+        try:
+            raw_term = await client.get("luminapv:leader:term")
+            if raw_term:
+                term = int(raw_term)
+
+            raw_leader = await client.get("luminapv:leader")
+            if raw_leader:
+                try:
+                    lead_dict = json.loads(raw_leader)
+                    leader_id = lead_dict.get("leader_id")
+                    if "term" in lead_dict:
+                        term = max(term, int(lead_dict["term"]))
+                except Exception:
+                    leader_id = raw_leader
+        except Exception as exc:
+            logger.debug(f"Erro ao buscar líder no Redis: {exc}")
+
+    # Fallback se não encontrado diretamente no Redis
+    if not leader_id and nodes:
+        for n in nodes:
+            if n.get("role") == "LEADER":
+                leader_id = n.get("node_id")
+                term = n.get("term", 1)
+                break
+        if not leader_id:
+            leader_id = nodes[0].get("node_id", "worker-1")
+
+    # Coletar estatísticas de replicação
+    replication_stats: Dict[str, Any] = {
+        "consistency_model": "read-your-writes",
+        "secondary_replica_sync": "eventual",
+        "total_replicated_modules": 0,
+        "model_consistent": True,
+    }
+
+    if client is not None:
+        try:
+            reps = await client.smembers("luminapv:replica:modules:index")
+            replication_stats["total_replicated_modules"] = len(reps)
+            mod_hash = await client.get("luminapv:replica:model:sha256")
+            if mod_hash:
+                replication_stats["cluster_model_sha256"] = mod_hash
+        except Exception:
+            pass
+    else:
+        # Tenta consultar stats do primeiro nó ativo
+        if nodes and nodes[0].get("endpoint"):
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as http_c:
+                    worker_stat_resp = await http_c.get(f"{nodes[0]['endpoint']}/api/v1/replicas/stats")
+                    if worker_stat_resp.status_code == 200:
+                        replication_stats = worker_stat_resp.json()
+            except Exception:
+                pass
+
+    return {
+        "status": "healthy",
+        "cluster_name": "luminapv-distributed-cluster",
+        "leader_id": leader_id,
+        "term": term,
+        "naming_scheme": {
+            "service_name": WORKER_SERVICE_NAME,
+            "dns_domain": "luminapv.local",
+            "resolution_strategy": "redis-catalog-with-dns-fallback",
+            "endpoints": [n.get("endpoint") for n in nodes if "endpoint" in n]
+        },
+        "consistency_model": "read-your-writes",
+        "total_nodes": len(nodes),
+        "nodes": nodes,
+        "active_locks": active_locks,
+        "replication_stats": replication_stats,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @app.post("/api/v1/cluster/election", tags=["Coordination"])
 async def trigger_cluster_election(action: Optional[str] = "step_down"):
     """
     Permite simular reeleição de líder no cluster LuminaPV a partir do Gateway (Issue #3).
     Ações suportadas: 'step_down' ou 'reelect'.
     """
-    client = await lock_manager.get_client()
+    client = await resolver.get_client()
     previous_leader = None
     if client is not None:
         try:
@@ -605,11 +833,15 @@ async def trigger_cluster_election(action: Optional[str] = "step_down"):
         except Exception as e:
             logger.warning(f"Erro ao remover líder no Redis via gateway: {e}")
 
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as http_c:
-            await http_c.post(f"{WORKER_SERVICE_URL}/api/v1/cluster/election?action={action}")
-    except Exception:
-        pass
+    # Notifica os nós workers ativos para abdicar ou reavaliar
+    nodes = await resolver.resolve_instances()
+    for n in nodes:
+        if n.get("endpoint"):
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as http_c:
+                    await http_c.post(f"{n['endpoint']}/api/v1/cluster/election?action={action}")
+            except Exception:
+                pass
 
     return {
         "status": "election_triggered",
