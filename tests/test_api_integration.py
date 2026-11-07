@@ -2,7 +2,8 @@
 Integration Tests for Node 1 (Gateway) and Node 2 (Worker)
 ==========================================================
 Verifies:
-- Node 2 standalone endpoints (/health, /api/v1/process-module, error responses)
+- Node 2 standalone endpoints (/health, /api/v1/registry/node, /api/v1/process-module, error responses)
+- Node 2 service discovery heartbeat registration (Redis + memory fallback)
 - Node 1 static and console serving (/ and /fixtures/...)
 - Node 1 bulk orchestrator (/api/v1/analyze/bulk) with concurrent dispatch
 - Telemetry aggregation calculations and JSON contract conformity
@@ -27,6 +28,7 @@ sys.path.insert(0, str(ROOT_DIR / "node2_worker"))
 
 import node1_gateway.main as gateway_module
 from node1_gateway.main import app as gateway_app
+import node2_worker.main as worker_module
 from node2_worker.main import app as worker_app
 
 
@@ -46,18 +48,43 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         cls.gateway_client = TestClient(gateway_app)
 
     # -------------------------------------------------------------------------
-    # Node 2 (Worker) Tests
+    # Node 2 (Worker) & Service Discovery Tests
     # -------------------------------------------------------------------------
     def test_worker_health(self):
-        """Worker /health probe returns 200 and healthy status."""
+        """Worker /health probe returns 200, healthy status, and naming/registry metadata."""
         response = self.worker_client.get("/health")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "healthy")
         self.assertEqual(data["service"], "node2_worker")
+        self.assertIn("node_id", data)
+        self.assertIn("service_name", data)
+        self.assertIn("dns_name", data)
+        self.assertIn("model_sha256", data)
+        self.assertEqual(len(data["model_sha256"]), 64)
+
+    def test_worker_registry_node_endpoint_and_redis_heartbeat(self):
+        """Worker /api/v1/registry/node exposes naming metadata and supports Redis heartbeat."""
+        response = self.worker_client.get("/api/v1/registry/node")
+        self.assertEqual(response.status_code, 200)
+        meta = response.json()
+        self.assertEqual(meta["service_name"], "service://luminapv-vision-worker")
+        self.assertTrue(meta["dns_name"].endswith(".luminapv.local"))
+        self.assertEqual(meta["status"], "ONLINE")
+
+        # Verify Redis heartbeat registration with mocked Redis client
+        mock_redis = AsyncMock()
+        worker_module.registry.redis_client = mock_redis
+        try:
+            hb_meta = asyncio.run(worker_module.registry.register_heartbeat())
+            self.assertEqual(hb_meta["registry_backend"], "redis")
+            mock_redis.set.assert_awaited_once()
+            mock_redis.sadd.assert_awaited_once()
+        finally:
+            worker_module.registry.redis_client = None
 
     def test_worker_process_module_valid(self):
-        """Worker processes valid module scan and returns contract conforming JSON."""
+        """Worker processes valid module scan and returns contract conforming JSON with processed_by_node."""
         img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
         with open(img_path, "rb") as f:
             files = {"file": ("scan_module_6x10_pass.png", f.read(), "image/png")}
@@ -72,6 +99,8 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(data["cols"], 10)
         self.assertEqual(data["total_cells"], 60)
         self.assertEqual(data["status"], "PASS")
+        self.assertIn("processed_by_node", data)
+        self.assertIn("model_sha256", data)
         self.assertEqual(len(data["cells"]), 60)
 
     def test_worker_corrupted_image_returns_422(self):
@@ -145,6 +174,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "total_cells": 60,
             "defective_cells_count": 1,
             "module_damage_percentage": 1.7,
+            "processed_by_node": "worker-1",
             "cells": []
         }
         mock_module_fail = {
@@ -156,6 +186,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "total_cells": 72,
             "defective_cells_count": 12,
             "module_damage_percentage": 16.7,
+            "processed_by_node": "worker-2",
             "cells": []
         }
 

@@ -22,7 +22,8 @@ from cv_engine import (
     inspect_cell_region,
     classify_cell_yolo,
     draw_defect_annotations,
-    get_yolo_classifier
+    get_yolo_classifier,
+    get_model_sha256
 )
 
 
@@ -47,12 +48,20 @@ class TestCVEngine(unittest.TestCase):
         with open(img_path, "rb") as f:
             data = f.read()
 
-        result = evaluate_module(data, filename="scan_module_6x10_pass.png", use_yolo=False)
+        result = evaluate_module(
+            data,
+            filename="scan_module_6x10_pass.png",
+            use_yolo=False,
+            node_id="worker-1"
+        )
 
         self.assertEqual(result.rows, 6)
         self.assertEqual(result.cols, 10)
         self.assertEqual(result.total_cells, 60)
         self.assertEqual(len(result.cells), 60)
+        self.assertEqual(result.processed_by_node, "worker-1")
+        self.assertIsNotNone(result.model_sha256)
+        self.assertEqual(len(result.model_sha256), 64)
         # Verify strict enum types
         valid_enums = {e.value for e in DefectType}
         for cell in result.cells:
@@ -118,6 +127,9 @@ class TestCVEngine(unittest.TestCase):
         self.assertEqual(model.task, "classify")
         self.assertIn("boa", model.names.values())
         self.assertIn("defeituosa", model.names.values())
+
+        model_hash = get_model_sha256()
+        self.assertEqual(len(model_hash), 64)
 
         # Test inference on a 64x64 cell crop
         dummy_cell = np.full((64, 64), 180, dtype=np.uint8)

@@ -9,6 +9,7 @@ Purpose: Performs perspective normalization, dynamic arbitrary grid topology det
 
 import base64
 from enum import Enum
+import hashlib
 import logging
 import math
 import os
@@ -72,6 +73,8 @@ class ModuleResult(BaseModel):
     y_bounds: Optional[List[int]] = None
     active_area: Optional[Dict[str, Any]] = None
     rectified_image: Optional[str] = None
+    processed_by_node: Optional[str] = None
+    model_sha256: Optional[str] = None
     cells: List[CellInspection]
 
 
@@ -317,20 +320,16 @@ def inspect_cell_region(
 
 
 # -----------------------------------------------------------------------------
-# YOLOv8-cls Classification Engine (best.pt)
+# YOLOv8-cls Classification Engine (best.pt) & Model Hash Verification
 # -----------------------------------------------------------------------------
 _YOLO_CLASSIFIER: Optional[YOLO] = None
+_MODEL_SHA256: Optional[str] = None
 
 
-def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
+def resolve_model_path(weights_path: Optional[str] = None) -> str:
     """
-    Carrega e mantém em cache o modelo YOLOv8-cls (best.pt).
-    Busca no caminho explícito, variável de ambiente MODEL_PATH ou diretórios padrão.
+    Localiza o arquivo de pesos 'best.pt' nos diretórios candidatos padrão.
     """
-    global _YOLO_CLASSIFIER
-    if _YOLO_CLASSIFIER is not None and weights_path is None:
-        return _YOLO_CLASSIFIER
-
     target_path = weights_path or os.getenv("MODEL_PATH")
     if not target_path or not os.path.exists(target_path):
         candidate_paths = [
@@ -349,9 +348,45 @@ def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
 
     if not target_path or not os.path.exists(target_path):
         raise FileNotFoundError(
-            f"Arquivo de pesos 'best.pt' não encontrado nos caminhos padrão."
+            "Arquivo de pesos 'best.pt' não encontrado nos caminhos padrão."
         )
+    return target_path
 
+
+def get_model_sha256(weights_path: Optional[str] = None) -> str:
+    """
+    Calcula e mantém em cache o hash SHA-256 do arquivo de pesos 'best.pt'
+    para verificação de integridade e consistência entre workers distribuídos.
+    """
+    global _MODEL_SHA256
+    if _MODEL_SHA256 is not None and weights_path is None:
+        return _MODEL_SHA256
+
+    try:
+        path = resolve_model_path(weights_path)
+        sha = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha.update(chunk)
+        digest = sha.hexdigest()
+        if weights_path is None:
+            _MODEL_SHA256 = digest
+        return digest
+    except Exception as exc:
+        logger.warning(f"Não foi possível calcular SHA-256 do modelo: {exc}")
+        return "heuristic-fallback"
+
+
+def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
+    """
+    Carrega e mantém em cache o modelo YOLOv8-cls (best.pt).
+    Busca no caminho explícito, variável de ambiente MODEL_PATH ou diretórios padrão.
+    """
+    global _YOLO_CLASSIFIER
+    if _YOLO_CLASSIFIER is not None and weights_path is None:
+        return _YOLO_CLASSIFIER
+
+    target_path = resolve_model_path(weights_path)
     logger.info(f"Carregando modelo YOLOv8-cls a partir de: {target_path}")
     _YOLO_CLASSIFIER = YOLO(target_path)
     return _YOLO_CLASSIFIER
@@ -483,7 +518,8 @@ def evaluate_module(
     filename: str,
     fallback_idx: int = 1,
     use_yolo: bool = True,
-    model: Optional[YOLO] = None
+    model: Optional[YOLO] = None,
+    node_id: Optional[str] = None
 ) -> ModuleResult:
     """
     Complete end-to-end computer vision processing pipeline for a single PV module:
@@ -597,6 +633,8 @@ def evaluate_module(
     module_damage_pct = round((defective_count / float(total_cells)) * 100.0, 1) if total_cells > 0 else 0.0
     status = "FAIL" if module_damage_pct >= 5.0 else "PASS"
     module_id = generate_module_id(filename, fallback_idx)
+    resolved_node_id = node_id or os.getenv("NODE_ID", "worker-1")
+    model_hash = get_model_sha256()
 
     # Reconstructed / visual raster with bounding boxes highlighting defective cells
     annotated_panel = draw_defect_annotations(rectified, cells, draw_banner=False)
@@ -618,5 +656,7 @@ def evaluate_module(
         y_bounds=y_bounds,
         active_area=active_area,
         rectified_image=rectified_image,
+        processed_by_node=resolved_node_id,
+        model_sha256=model_hash,
         cells=cells
     )
