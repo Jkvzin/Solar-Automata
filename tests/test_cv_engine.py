@@ -21,6 +21,7 @@ from cv_engine import (
     detect_grid_topology,
     inspect_cell_region,
     classify_cell_yolo,
+    classify_cells_batch_yolo,
     draw_defect_annotations,
     get_yolo_classifier,
     get_model_sha256
@@ -62,6 +63,9 @@ class TestCVEngine(unittest.TestCase):
         self.assertEqual(result.processed_by_node, "worker-1")
         self.assertIsNotNone(result.model_sha256)
         self.assertEqual(len(result.model_sha256), 64)
+        self.assertIsNotNone(result.content_sha256)
+        self.assertEqual(len(result.content_sha256), 64)
+        self.assertEqual(result.consistency_model, "read-your-writes")
         # Verify strict enum types
         valid_enums = {e.value for e in DefectType}
         for cell in result.cells:
@@ -121,7 +125,7 @@ class TestCVEngine(unittest.TestCase):
         self.assertEqual(result.total_cells, 60)
 
     def test_yolo_classifier_loading_and_inference(self):
-        """Verify YOLOv8-cls model loads and classifies cell crops correctly."""
+        """Verify YOLOv8-cls model loads and classifies single & batch cell crops correctly."""
         model = get_yolo_classifier()
         self.assertIsNotNone(model)
         self.assertEqual(model.task, "classify")
@@ -131,13 +135,27 @@ class TestCVEngine(unittest.TestCase):
         model_hash = get_model_sha256()
         self.assertEqual(len(model_hash), 64)
 
-        # Test inference on a 64x64 cell crop
+        # Test single inference on a 64x64 cell crop
         dummy_cell = np.full((64, 64), 180, dtype=np.uint8)
         is_defective, defect_type, confidence = classify_cell_yolo(dummy_cell, model=model)
         self.assertIsInstance(is_defective, bool)
         self.assertIsInstance(defect_type, DefectType)
         self.assertGreaterEqual(confidence, 0.0)
         self.assertLessEqual(confidence, 1.0)
+
+        # Test vectorized batch inference on multiple cell crops
+        batch_crops = [
+            np.full((64, 64), 180, dtype=np.uint8),
+            np.full((64, 64), 25, dtype=np.uint8),
+            np.full((64, 64, 3), 150, dtype=np.uint8)
+        ]
+        batch_preds = classify_cells_batch_yolo(batch_crops, model=model)
+        self.assertEqual(len(batch_preds), 3)
+        for pred_def, pred_type, pred_conf in batch_preds:
+            self.assertIsInstance(pred_def, bool)
+            self.assertIsInstance(pred_type, DefectType)
+            self.assertGreaterEqual(pred_conf, 0.0)
+            self.assertLessEqual(pred_conf, 1.0)
 
     def test_draw_defect_annotations(self):
         """Verify drawing bounding boxes on defective cells."""

@@ -75,6 +75,10 @@ class ModuleResult(BaseModel):
     rectified_image: Optional[str] = None
     processed_by_node: Optional[str] = None
     model_sha256: Optional[str] = None
+    content_sha256: Optional[str] = None
+    replicated: bool = False
+    consistency_model: str = "read-your-writes"
+    cache_hit: bool = False
     cells: List[CellInspection]
 
 
@@ -392,6 +396,17 @@ def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
     return _YOLO_CLASSIFIER
 
 
+def _format_cell_crop_bgr(cell_crop: np.ndarray) -> np.ndarray:
+    """
+    Garante que o crop da célula possua 3 canais (BGR) para entrada no YOLOv8-cls.
+    """
+    if len(cell_crop.shape) == 2:
+        return cv2.cvtColor(cell_crop, cv2.COLOR_GRAY2BGR)
+    if cell_crop.shape[2] == 4:
+        return cv2.cvtColor(cell_crop, cv2.COLOR_BGRA2BGR)
+    return cell_crop
+
+
 def classify_cell_yolo(
     cell_crop: np.ndarray,
     model: Optional[YOLO] = None
@@ -408,13 +423,7 @@ def classify_cell_yolo(
     if model is None:
         model = get_yolo_classifier()
 
-    # Formatar o crop para 3 canais (BGR) exigido pela rede
-    if len(cell_crop.shape) == 2:
-        cell_input = cv2.cvtColor(cell_crop, cv2.COLOR_GRAY2BGR)
-    elif cell_crop.shape[2] == 4:
-        cell_input = cv2.cvtColor(cell_crop, cv2.COLOR_BGRA2BGR)
-    else:
-        cell_input = cell_crop
+    cell_input = _format_cell_crop_bgr(cell_crop)
 
     # Inferência Ultralytics YOLOv8-cls
     results = model(cell_input, verbose=False)
@@ -428,6 +437,37 @@ def classify_cell_yolo(
     defect_type = DefectType.DEFEITUOSA if is_defective else DefectType.NONE
 
     return is_defective, defect_type, round(confidence, 4)
+
+
+def classify_cells_batch_yolo(
+    cell_crops: List[np.ndarray],
+    model: Optional[YOLO] = None
+) -> List[Tuple[bool, DefectType, float]]:
+    """
+    Realiza inferência vetorizada em lote (Batch Inference) sobre todas as células
+    recortadas de um módulo fotovoltaico em uma única chamada ao motor YOLOv8-cls,
+    reduzindo significativamente o overhead de invocação por célula em sistemas distribuídos.
+    """
+    if not cell_crops:
+        return []
+
+    if model is None:
+        model = get_yolo_classifier()
+
+    batch_inputs = [_format_cell_crop_bgr(crop) for crop in cell_crops]
+    results = model(batch_inputs, verbose=False)
+
+    predictions: List[Tuple[bool, DefectType, float]] = []
+    for res in results:
+        probs = res.probs
+        top1_idx = probs.top1
+        pred_label = str(res.names[top1_idx]).strip().lower()
+        confidence = float(probs.top1conf)
+        is_defective = (pred_label in ["defeituosa", "defeito", "defect", "defective"])
+        defect_type = DefectType.DEFEITUOSA if is_defective else DefectType.NONE
+        predictions.append((is_defective, defect_type, round(confidence, 4)))
+
+    return predictions
 
 
 def draw_defect_annotations(
@@ -527,12 +567,14 @@ def evaluate_module(
     2. Perspective normalization (homography rectification)
     3. Dynamic grid topology detection (arbitrary R rows x C cols)
     4. In-memory cell slicing (R*C sub-arrays)
-    5. YOLOv8-cls classification per cell (best.pt)
+    5. Vectorized batch YOLOv8-cls classification per cell (best.pt)
     6. Module damage % computation and FAIL/PASS classification
     7. Visual reconstruction with defect bounding boxes
     """
     if not image_bytes or len(image_bytes) < 32:
         raise ValueError("Empty or corrupted image byte stream.")
+
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
 
     np_buffer = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(np_buffer, cv2.IMREAD_GRAYSCALE)
@@ -566,7 +608,7 @@ def evaluate_module(
     module_median_int = float(np.median(rectified))
     module_std_int = float(np.std(rectified))
 
-    # 3. In-Memory Cell Slicing and YOLOv8-cls Inspection
+    # 3. In-Memory Cell Slicing and Batch YOLOv8-cls Inspection
     cells: List[CellInspection] = []
     defective_count = 0
     yolo_model: Optional[YOLO] = model
@@ -580,54 +622,54 @@ def evaluate_module(
             )
             yolo_model = None
 
+    cell_slices: List[Tuple[int, int, int, int, int, int, np.ndarray]] = []
     for r in range(rows):
         y0, y1 = y_bounds[r], y_bounds[r + 1]
         for c in range(cols):
             x0, x1 = x_bounds[c], x_bounds[c + 1]
             idx = r * cols + c
-
-            # Slice sub-array directly in memory (zero disk I/O)
             cell_img = rectified[y0:y1, x0:x1]
+            cell_slices.append((idx, r, c, x0, y0, x1, y1, cell_img))
 
-            if yolo_model is not None:
-                is_defective, defect_type, confidence = classify_cell_yolo(
-                    cell_img,
-                    model=yolo_model
-                )
-            else:
-                is_defective, defect_type, confidence = inspect_cell_region(
-                    cell_img,
-                    module_median_int,
-                    module_std_int
-                )
+    if yolo_model is not None and cell_slices:
+        batch_preds = classify_cells_batch_yolo(
+            [item[7] for item in cell_slices],
+            model=yolo_model
+        )
+    else:
+        batch_preds = [
+            inspect_cell_region(item[7], module_median_int, module_std_int)
+            for item in cell_slices
+        ]
 
-            if is_defective:
-                defective_count += 1
+    for (idx, r, c, x0, y0, x1, y1, _), (is_defective, defect_type, confidence) in zip(cell_slices, batch_preds):
+        if is_defective:
+            defective_count += 1
 
-            cell_w = int(x1 - x0)
-            cell_h = int(y1 - y0)
-            bbox = CellBoundingBox(
-                x=int(x0),
-                y=int(y0),
-                width=cell_w,
-                height=cell_h,
-                x_pct=round((x0 / float(w)) * 100.0, 3),
-                y_pct=round((y0 / float(h)) * 100.0, 3),
-                width_pct=round((cell_w / float(w)) * 100.0, 3),
-                height_pct=round((cell_h / float(h)) * 100.0, 3)
+        cell_w = int(x1 - x0)
+        cell_h = int(y1 - y0)
+        bbox = CellBoundingBox(
+            x=int(x0),
+            y=int(y0),
+            width=cell_w,
+            height=cell_h,
+            x_pct=round((x0 / float(w)) * 100.0, 3),
+            y_pct=round((y0 / float(h)) * 100.0, 3),
+            width_pct=round((cell_w / float(w)) * 100.0, 3),
+            height_pct=round((cell_h / float(h)) * 100.0, 3)
+        )
+
+        cells.append(
+            CellInspection(
+                index=idx,
+                row=r,
+                col=c,
+                is_defective=is_defective,
+                defect_type=defect_type,
+                confidence=confidence,
+                bbox=bbox
             )
-
-            cells.append(
-                CellInspection(
-                    index=idx,
-                    row=r,
-                    col=c,
-                    is_defective=is_defective,
-                    defect_type=defect_type,
-                    confidence=confidence,
-                    bbox=bbox
-                )
-            )
+        )
 
     # 4. Classification & Metrics
     module_damage_pct = round((defective_count / float(total_cells)) * 100.0, 1) if total_cells > 0 else 0.0
@@ -658,5 +700,9 @@ def evaluate_module(
         rectified_image=rectified_image,
         processed_by_node=resolved_node_id,
         model_sha256=model_hash,
+        content_sha256=content_hash,
+        replicated=False,
+        consistency_model="read-your-writes",
+        cache_hit=False,
         cells=cells
     )

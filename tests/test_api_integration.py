@@ -2,8 +2,9 @@
 Integration Tests for Node 1 (Gateway) and Node 2 (Worker)
 ==========================================================
 Verifies:
-- Node 2 standalone endpoints (/health, /api/v1/registry/node, /api/v1/process-module, error responses)
+- Node 2 standalone endpoints (/health, /api/v1/registry/node, /api/v1/replicas/stats, /api/v1/process-module)
 - Node 2 service discovery heartbeat registration (Redis + memory fallback)
+- Node 2 Primary-Backup result replication, Read-Your-Writes distributed cache hit, and model consistency
 - Node 1 static and console serving (/ and /fixtures/...)
 - Node 1 bulk orchestrator (/api/v1/analyze/bulk) with concurrent dispatch
 - Telemetry aggregation calculations and JSON contract conformity
@@ -48,10 +49,10 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         cls.gateway_client = TestClient(gateway_app)
 
     # -------------------------------------------------------------------------
-    # Node 2 (Worker) & Service Discovery Tests
+    # Node 2 (Worker), Service Discovery & Replication Tests
     # -------------------------------------------------------------------------
     def test_worker_health(self):
-        """Worker /health probe returns 200, healthy status, and naming/registry metadata."""
+        """Worker /health probe returns 200, healthy status, naming, and consistency metadata."""
         response = self.worker_client.get("/health")
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -62,6 +63,8 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertIn("dns_name", data)
         self.assertIn("model_sha256", data)
         self.assertEqual(len(data["model_sha256"]), 64)
+        self.assertEqual(data["consistency_model"], "read-your-writes")
+        self.assertTrue(data["model_consistent"])
 
     def test_worker_registry_node_endpoint_and_redis_heartbeat(self):
         """Worker /api/v1/registry/node exposes naming metadata and supports Redis heartbeat."""
@@ -84,12 +87,14 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             worker_module.registry.redis_client = None
 
     def test_worker_process_module_valid(self):
-        """Worker processes valid module scan and returns contract conforming JSON with processed_by_node."""
+        """Worker processes valid module scan and returns contract conforming JSON with replication metadata."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
         img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
         with open(img_path, "rb") as f:
-            files = {"file": ("scan_module_6x10_pass.png", f.read(), "image/png")}
+            raw_bytes = f.read()
 
-        response = self.worker_client.post("/api/v1/process-module?use_yolo=false", files=files)
+        files = {"file": ("scan_module_6x10_pass.png", raw_bytes, "image/png")}
+        response = self.worker_client.post("/api/v1/process-module?use_yolo=false&use_cache=false", files=files)
         self.assertEqual(response.status_code, 200)
         data = response.json()
 
@@ -101,7 +106,56 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(data["status"], "PASS")
         self.assertIn("processed_by_node", data)
         self.assertIn("model_sha256", data)
+        self.assertIn("content_sha256", data)
+        self.assertTrue(data["replicated"])
+        self.assertFalse(data["cache_hit"])
+        self.assertEqual(data["consistency_model"], "read-your-writes")
         self.assertEqual(len(data["cells"]), 60)
+
+    def test_worker_distributed_replication_and_read_your_writes_cache(self):
+        """Worker replicates ModuleResult and serves Read-Your-Writes cache hit on subsequent requests."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            raw_bytes = f.read()
+
+        # 1st request: cache miss -> evaluates and replicates
+        res1 = self.worker_client.post(
+            "/api/v1/process-module?use_yolo=false&use_cache=true",
+            files={"file": ("scan_01.png", raw_bytes, "image/png")}
+        )
+        self.assertEqual(res1.status_code, 200)
+        d1 = res1.json()
+        self.assertTrue(d1["replicated"])
+        self.assertFalse(d1["cache_hit"])
+        content_hash = d1["content_sha256"]
+
+        # 2nd request with same image content: Read-Your-Writes cache HIT
+        res2 = self.worker_client.post(
+            "/api/v1/process-module?use_yolo=false&use_cache=true",
+            files={"file": ("scan_02.png", raw_bytes, "image/png")}
+        )
+        self.assertEqual(res2.status_code, 200)
+        d2 = res2.json()
+        self.assertTrue(d2["replicated"])
+        self.assertTrue(d2["cache_hit"])
+        self.assertEqual(d2["content_sha256"], content_hash)
+        self.assertEqual(d2["filename"], "scan_02.png")
+
+        # Verify GET /api/v1/replicas/{content_sha256}
+        replica_resp = self.worker_client.get(f"/api/v1/replicas/{content_hash}")
+        self.assertEqual(replica_resp.status_code, 200)
+        self.assertEqual(replica_resp.json()["content_sha256"], content_hash)
+
+        # Verify GET /api/v1/replicas/stats
+        stats_resp = self.worker_client.get("/api/v1/replicas/stats")
+        self.assertEqual(stats_resp.status_code, 200)
+        stats = stats_resp.json()
+        self.assertEqual(stats["consistency_model"], "read-your-writes")
+        self.assertEqual(stats["replication_strategy"], "primary-backup")
+        self.assertTrue(stats["model_consistent"])
+        self.assertGreaterEqual(stats["total_replicated_modules"], 1)
+        self.assertGreaterEqual(stats["cache_hits"], 1)
 
     def test_worker_corrupted_image_returns_422(self):
         """Worker returns HTTP 422 with structured detail when image is corrupt."""
@@ -175,6 +229,8 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "defective_cells_count": 1,
             "module_damage_percentage": 1.7,
             "processed_by_node": "worker-1",
+            "replicated": True,
+            "consistency_model": "read-your-writes",
             "cells": []
         }
         mock_module_fail = {
@@ -187,6 +243,8 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "defective_cells_count": 12,
             "module_damage_percentage": 16.7,
             "processed_by_node": "worker-2",
+            "replicated": True,
+            "consistency_model": "read-your-writes",
             "cells": []
         }
 
