@@ -445,13 +445,18 @@ function pollClusterStatus() {
       }
 
       state.cluster = data;
+      state.clusterFailures = 0;
       renderTopology();
       setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
       return data;
     })
     .catch(function(err) {
-      // Graceful degradation: do NOT throw errors or pollute console if cluster backend is offline
-      // Keeps existing state without breaking local inspection
+      // Graceful degradation: track failures and notify statusbar if disconnected
+      state.clusterFailures = (state.clusterFailures || 0) + 1;
+      if (state.clusterFailures >= 3) {
+        var sbCluster = $("#sbCluster");
+        if (sbCluster) sbCluster.textContent = "CLUSTER: DESCONECTADO";
+      }
       return null;
     });
 }
