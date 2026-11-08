@@ -32,6 +32,7 @@ from cv_engine import (
     apply_clahe_normalization,
     classify_cell_yolo,
     classify_cells_batch_yolo,
+    classify_single_cell_tta_yolo,
     detect_grid_topology,
     detect_panel_quadrilateral,
     draw_defect_annotations,
@@ -563,6 +564,32 @@ class TestCVEngine(unittest.TestCase):
                 self.assertEqual(res.cols, exp_c)
                 self.assertGreaterEqual(res.module_damage_percentage, 5.0)
                 self.assertEqual(res.status, "FAIL")
+
+    def test_single_cell_1x1_topology_and_tta_evaluation(self):
+        """
+        Verify that an isolated square/near-square EL cell image (e.g., 300x300 single cell)
+        is detected as rows=1, cols=1 (total_cells=1) without triggering spurious 6x10 slicing,
+        and is evaluated via TTA with 0.0% (PASS) or 100.0% (FAIL) damage percentage.
+        """
+        single_good_cell = create_synthetic_el_cell(300, 300, defect_type="none")
+        # Add 3 horizontal busbars typical of a 300x300 single EL cell
+        for frac in (0.25, 0.50, 0.75):
+            by = int(300 * frac)
+            single_good_cell[by - 1:by + 2, :] = 85
+
+        rows, cols, y_b, x_b = detect_grid_topology(single_good_cell)
+        self.assertEqual(rows, 1)
+        self.assertEqual(cols, 1)
+        self.assertEqual(y_b, [0, 300])
+        self.assertEqual(x_b, [0, 300])
+
+        _, buf_good = cv2.imencode(".png", single_good_cell)
+        res_good = evaluate_module(buf_good.tobytes(), filename="cell_good_300x300.png", use_yolo=True)
+        self.assertEqual(res_good.rows, 1)
+        self.assertEqual(res_good.cols, 1)
+        self.assertEqual(res_good.total_cells, 1)
+        self.assertIn(res_good.module_damage_percentage, (0.0, 100.0))
+        self.assertEqual(res_good.status, "FAIL" if res_good.defective_cells_count == 1 else "PASS")
 
 
 if __name__ == "__main__":

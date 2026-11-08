@@ -28,8 +28,8 @@ from ultralytics import YOLO
 
 logger = logging.getLogger("cv_engine")
 
-# Standard commercial PV module cell counts (Full-cell & Half-cut families)
-PLAUSIBLE_CELL_COUNTS = {36, 48, 54, 60, 66, 72, 96, 108, 120, 132, 144}
+# Standard commercial PV module cell counts (Full-cell, Half-cut & 1x1 Single-Cell)
+PLAUSIBLE_CELL_COUNTS = {1, 36, 48, 54, 60, 66, 72, 96, 108, 120, 132, 144}
 STANDARD_FAMILIES = {60, 72, 120, 144}
 
 
@@ -477,6 +477,10 @@ def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
         gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
 
     h, w = gray_img.shape[:2]
+    # Isolated single-cell crops (e.g., 300x300 ELPV cells) are already ortho-cropped
+    if max(h, w) <= 360 and (0.82 <= (float(w) / float(max(1, h))) <= 1.22):
+        return gray_img
+
     ordered = detect_panel_quadrilateral(gray_img)
     if ordered is None:
         return gray_img
@@ -809,6 +813,10 @@ def detect_grid_topology(rectified_img: np.ndarray) -> Tuple[int, int, List[int]
     if ah < 32 or aw < 32:
         return _geometric_grid_fallback(h, w, 0, h - 1, 0, w - 1)
 
+    img_ar = float(w) / float(max(1, h))
+    active_ar = float(aw) / float(max(1, ah))
+    is_square_like = (0.82 <= img_ar <= 1.22) or (0.82 <= active_ar <= 1.22)
+
     # 2. Dynamic 1D projection valley & edge detection along Y (rows) and X (cols)
     row_divs, _ = _detect_1d_dividers(active_sub, axis=1, min_cells=4, max_cells=26)
     col_divs, _ = _detect_1d_dividers(active_sub, axis=0, min_cells=4, max_cells=26)
@@ -822,6 +830,18 @@ def detect_grid_topology(rectified_img: np.ndarray) -> Tuple[int, int, List[int]
 
     rows = len(y_bounds) - 1
     cols = len(x_bounds) - 1
+
+    # Single-Cell (1x1) EL Image Detection:
+    # When an isolated square/near-square cell image (e.g., 300x300 from ELPV/amostra) is uploaded,
+    # it lacks a valid commercial multi-cell grid topology. Return 1x1 directly instead of slicing into 6x10.
+    multi_cell_families = PLAUSIBLE_CELL_COUNTS - {1}
+    if is_square_like and (
+        max(h, w) <= 360
+        or rows < 4
+        or cols < 4
+        or (rows * cols) not in multi_cell_families
+    ):
+        return 1, 1, [0, h], [0, w]
 
     # 4. Integrity & Plausibility Validation + Geometric Fallback on Severe Noise
     mean_cell_h = float(y_bounds[-1] - y_bounds[0]) / max(1, rows)
@@ -1245,6 +1265,48 @@ def classify_cells_batch_yolo(
     return predictions
 
 
+def classify_single_cell_tta_yolo(
+    cell_crop: np.ndarray,
+    model: Optional[YOLO] = None,
+    defect_threshold: float = 0.55
+) -> Tuple[bool, DefectType, float]:
+    """
+    Executa inferência com Test-Time Augmentation (TTA: original + espelhamento
+    horizontal + espelhamento vertical) para células unitárias (1x1).
+    Consolida a probabilidade média da classe defeituosa, aumentando a robustez
+    contra artefatos de orientação ou iluminação em imagens de células isoladas.
+    """
+    if model is None:
+        model = get_yolo_classifier()
+
+    orig_bgr = _format_cell_crop_bgr(cell_crop, trim_border=False)
+    hflip_bgr = _format_cell_crop_bgr(cv2.flip(cell_crop, 1), trim_border=False)
+    vflip_bgr = _format_cell_crop_bgr(cv2.flip(cell_crop, 0), trim_border=False)
+
+    results = model([orig_bgr, hflip_bgr, vflip_bgr], verbose=False)
+    def_probs: List[float] = []
+    for res in results:
+        probs = res.probs
+        # Localiza o índice da classe defeituosa no dicionário de nomes do modelo
+        def_idx = next(
+            (k for k, v in res.names.items() if str(v).strip().lower() in ["defeituosa", "defeito", "defect", "defective"]),
+            None
+        )
+        if def_idx is not None:
+            def_probs.append(float(probs.data[def_idx].item()))
+        else:
+            top1_idx = probs.top1
+            pred_label = str(res.names[top1_idx]).strip().lower()
+            conf = float(probs.top1conf)
+            def_probs.append(conf if pred_label in ["defeituosa", "defeito", "defect", "defective"] else (1.0 - conf))
+
+    mean_def_prob = float(np.mean(def_probs)) if def_probs else 0.0
+    is_defective = mean_def_prob >= defect_threshold
+    defect_type = DefectType.DEFEITUOSA if is_defective else DefectType.NONE
+    confidence = mean_def_prob if is_defective else (1.0 - mean_def_prob)
+    return is_defective, defect_type, round(confidence, 4)
+
+
 def draw_defect_annotations(
     image: np.ndarray,
     cells: List[CellInspection],
@@ -1407,34 +1469,39 @@ def evaluate_module(
     segmented_cells = segment_panel_cells(rectified, y_bounds=y_bounds, x_bounds=x_bounds)
 
     if yolo_model is not None and segmented_cells:
-        raw_yolo_preds = classify_cells_batch_yolo(
-            [item["image"] for item in segmented_cells],
-            model=yolo_model
-        )
-        batch_preds = []
-        for item, (y_def, y_type, y_conf) in zip(segmented_cells, raw_yolo_preds):
-            cell_img = item["image"]
-            h_def, h_type, h_conf = inspect_cell_region(cell_img, module_median_int, module_std_int)
-            inner = _trim_cell_gap_margins(cell_img, trim_ratio=0.10)
-            c_mean = float(np.mean(inner)) if inner.size > 0 else float(np.mean(cell_img))
-            c_std = float(np.std(inner)) if inner.size > 0 else float(np.std(cell_img))
-            rel_b = c_mean / max(module_median_int, 20.0)
+        if total_cells == 1:
+            batch_preds = [
+                classify_single_cell_tta_yolo(segmented_cells[0]["image"], model=yolo_model)
+            ]
+        else:
+            raw_yolo_preds = classify_cells_batch_yolo(
+                [item["image"] for item in segmented_cells],
+                model=yolo_model
+            )
+            batch_preds = []
+            for item, (y_def, y_type, y_conf) in zip(segmented_cells, raw_yolo_preds):
+                cell_img = item["image"]
+                h_def, h_type, h_conf = inspect_cell_region(cell_img, module_median_int, module_std_int)
+                inner = _trim_cell_gap_margins(cell_img, trim_ratio=0.10)
+                c_mean = float(np.mean(inner)) if inner.size > 0 else float(np.mean(cell_img))
+                c_std = float(np.std(inner)) if inner.size > 0 else float(np.std(cell_img))
+                rel_b = c_mean / max(module_median_int, 20.0)
 
-            if y_def:
-                # Cross-validate with radiometric & gradient consistency to suppress false alarms
-                # caused by perspective warp interpolation, half-cut aspect ratios, or borderline scores
-                if not h_def and c_std < 10.5 and (0.85 <= rel_b <= 1.15):
-                    batch_preds.append((False, DefectType.NONE, h_conf))
-                elif not h_def and y_conf < 0.78 and (0.88 <= rel_b <= 1.12):
-                    batch_preds.append((False, DefectType.NONE, h_conf))
+                if y_def:
+                    # Cross-validate with radiometric & gradient consistency to suppress false alarms
+                    # caused by perspective warp interpolation, half-cut aspect ratios, or borderline scores
+                    if not h_def and c_std < 10.5 and (0.85 <= rel_b <= 1.15):
+                        batch_preds.append((False, DefectType.NONE, h_conf))
+                    elif not h_def and y_conf < 0.78 and (0.88 <= rel_b <= 1.12):
+                        batch_preds.append((False, DefectType.NONE, h_conf))
+                    else:
+                        batch_preds.append((True, y_type, y_conf))
                 else:
-                    batch_preds.append((True, y_type, y_conf))
-            else:
-                # Recover severe physical defects (completely dead cell or synthetic defect)
-                if h_def and (h_type == DefectType.DEAD or (c_std < 17.5 and h_conf >= 0.65)):
-                    batch_preds.append((True, DefectType.DEFEITUOSA, h_conf))
-                else:
-                    batch_preds.append((False, DefectType.NONE, y_conf))
+                    # Recover severe physical defects (completely dead cell or synthetic defect)
+                    if h_def and (h_type == DefectType.DEAD or (c_std < 17.5 and h_conf >= 0.65)):
+                        batch_preds.append((True, DefectType.DEFEITUOSA, h_conf))
+                    else:
+                        batch_preds.append((False, DefectType.NONE, y_conf))
     else:
         batch_preds = [
             inspect_cell_region(item["image"], module_median_int, module_std_int)
