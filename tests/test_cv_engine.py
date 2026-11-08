@@ -1,31 +1,121 @@
 """
 Unit Tests for Computer Vision & Signal Processing Engine (Node 2)
 ==================================================================
+Covers:
+- Legacy & standard module fixtures (6x10 PASS, 6x12 FAIL, 12x10 Half-Cut, Tilted)
+- Mild rotations (+/- 10 degrees) with bench noise & frame reflections
+- Trapezoidal perspective distortion (non-orthogonal camera homography)
+- Panels with dark/dead border and corner cells (including full dark border row)
+- Standard Full-Cell vs. Half-Cut (Split-Cell with wide central junction gap)
+- Spatial traceability metadata contract: {"cell_id", "row", "col", "bbox", "image"}
+- Geometric aspect-ratio fallback under severe noise & plausibility logging
+- Strict preservation of YOLOv8-cls (best.pt) model input contract
 """
 
+import logging
 import os
 from pathlib import Path
 import sys
+from typing import Dict, Optional, Tuple
 import unittest
 
 import cv2
 import numpy as np
 
-# Add node2_worker to sys.path
+# Add node2_worker and tests to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "node2_worker"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cv_engine import (
     DefectType,
-    evaluate_module,
-    normalize_perspective,
-    detect_grid_topology,
-    inspect_cell_region,
+    apply_clahe_normalization,
     classify_cell_yolo,
     classify_cells_batch_yolo,
+    detect_grid_topology,
+    detect_panel_quadrilateral,
     draw_defect_annotations,
+    evaluate_module,
+    get_model_sha256,
     get_yolo_classifier,
-    get_model_sha256
+    inspect_cell_region,
+    normalize_perspective,
+    preprocess_el_module,
+    segment_panel_cells,
 )
+from generate_test_modules import create_synthetic_el_cell, generate_module_image
+
+
+def _generate_half_cut_with_central_gap(
+    rows: int = 12,
+    cols: int = 10,
+    cell_w: int = 60,
+    cell_h: int = 35,
+    gap_px: int = 4,
+    central_gap_px: int = 22,
+    outer_border_px: int = 24,
+    defect_map: Optional[Dict[Tuple[int, int], str]] = None,
+) -> np.ndarray:
+    """
+    Helper to synthesize a realistic Half-Cut (Split-Cell) PV module with a wider
+    central horizontal gap where the central junction box / inter-string busbar sits.
+    """
+    if defect_map is None:
+        defect_map = {}
+
+    mid_row = rows // 2
+    active_w = cols * cell_w + (cols - 1) * gap_px
+    active_h = rows * cell_h + (rows - 2) * gap_px + central_gap_px
+
+    total_w = active_w + outer_border_px * 2
+    total_h = active_h + outer_border_px * 2
+
+    module_img = np.full((total_h, total_w), 18, dtype=np.uint8)
+
+    y_cursor = outer_border_px
+    for r in range(rows):
+        y_start = y_cursor
+        y_end = y_start + cell_h
+        for c in range(cols):
+            x_start = outer_border_px + c * (cell_w + gap_px)
+            x_end = x_start + cell_w
+            dtype = defect_map.get((r, c), "none")
+            module_img[y_start:y_end, x_start:x_end] = create_synthetic_el_cell(
+                cell_w, cell_h, defect_type=dtype
+            )
+        y_cursor = y_end + (central_gap_px if (r + 1) == mid_row else gap_px)
+
+    return module_img
+
+
+def _rotate_module_on_canvas(module_img: np.ndarray, angle_deg: float, add_bench_noise: bool = True) -> np.ndarray:
+    """
+    Places a PV module on a dark test-bench canvas and rotates it by `angle_deg` degrees,
+    optionally injecting small background bench noise blobs.
+    """
+    h, w = module_img.shape[:2]
+    pad = int(max(h, w) * 0.25)
+    canvas_h = h + pad * 2
+    canvas_w = w + pad * 2
+    canvas = np.full((canvas_h, canvas_w), 5, dtype=np.uint8)
+    canvas[pad:pad + h, pad:pad + w] = module_img
+
+    center = (canvas_w / 2.0, canvas_h / 2.0)
+    rot_mat = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    rotated = cv2.warpAffine(
+        canvas,
+        rot_mat,
+        (canvas_w, canvas_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=5,
+    )
+
+    if add_bench_noise:
+        # Inject isolated bench reflection specks in the outer corners
+        rotated[10:14, 10:15] = 190
+        rotated[canvas_h - 15:canvas_h - 11, canvas_w - 16:canvas_w - 11] = 210
+
+    return rotated
 
 
 class TestCVEngine(unittest.TestCase):
@@ -124,6 +214,213 @@ class TestCVEngine(unittest.TestCase):
         self.assertEqual(result.cols, 10)
         self.assertEqual(result.total_cells, 60)
 
+    def test_rotation_plus_and_minus_10_degrees(self):
+        """Verify homography rectification and grid segmentation under +/- 10 degree rotations."""
+        base_panel = generate_module_image(
+            rows=6,
+            cols=10,
+            defect_map={(1, 3): "dead", (4, 7): "hot-spot"},
+            apply_perspective_tilt=False,
+        )
+
+        for angle in (10.0, -10.0):
+            with self.subTest(angle_deg=angle):
+                rotated = _rotate_module_on_canvas(base_panel, angle_deg=angle, add_bench_noise=True)
+                _, buf = cv2.imencode(".png", rotated)
+                result = evaluate_module(
+                    buf.tobytes(),
+                    filename=f"scan_rot_{int(angle)}.png",
+                    use_yolo=False,
+                )
+                self.assertEqual(result.rows, 6)
+                self.assertEqual(result.cols, 10)
+                self.assertEqual(result.total_cells, 60)
+                self.assertEqual(len(result.cells), 60)
+
+    def test_trapezoidal_perspective_distortion(self):
+        """Verify rectification of severe trapezoidal perspective distortion (non-orthogonal camera)."""
+        base_panel = generate_module_image(
+            rows=6,
+            cols=10,
+            defect_map={(2, 2): "dead", (3, 8): "micro-crack"},
+            apply_perspective_tilt=False,
+        )
+        ph, pw = base_panel.shape[:2]
+        pad = 90
+        canvas_w = pw + pad * 2
+        canvas_h = ph + pad * 2
+        canvas = np.full((canvas_h, canvas_w), 5, dtype=np.uint8)
+        canvas[pad:pad + ph, pad:pad + pw] = base_panel
+
+        src_pts = np.array([
+            [pad, pad],
+            [pad + pw, pad],
+            [pad + pw, pad + ph],
+            [pad, pad + ph],
+        ], dtype=np.float32)
+
+        # Strong trapezoidal foreshortening: top edge narrowed by 110px, bottom widened, vertical skew
+        dst_pts = np.array([
+            [pad + 60, pad + 45],
+            [pad + pw - 55, pad + 30],
+            [pad + pw + 15, pad + ph - 10],
+            [pad - 15, pad + ph - 25],
+        ], dtype=np.float32)
+
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        trapezoid_img = cv2.warpPerspective(canvas, M, (canvas_w, canvas_h), borderValue=5)
+
+        preproc = preprocess_el_module(trapezoid_img)
+        self.assertEqual(preproc["rows"], 6)
+        self.assertEqual(preproc["cols"], 10)
+        self.assertEqual(preproc["total_cells"], 60)
+        self.assertTrue(preproc["is_plausible_topology"])
+        self.assertEqual(len(preproc["cells"]), 60)
+
+    def test_panel_with_dark_border_and_corner_cells(self):
+        """
+        Verify that panels with dead/dark peripheral and corner cells (even when tilted
+        or when an entire border row is dead) do not lose outer rows or columns.
+        """
+        # Case A: All 4 corners and multiple border cells are dead on a tilted module
+        dark_border_defects = {
+            (0, 0): "dead",
+            (0, 1): "dead",
+            (0, 9): "dead",
+            (5, 0): "dead",
+            (5, 9): "dead",
+            (2, 0): "dead",
+            (3, 9): "dead",
+        }
+        panel_a = generate_module_image(
+            rows=6,
+            cols=10,
+            defect_map=dark_border_defects,
+            apply_perspective_tilt=True,
+        )
+        # Even if corner (0,0) is completely blacked out to canvas level (0), 4-line hull
+        # intersection reconstructs the missing corner
+        preproc_a = preprocess_el_module(panel_a)
+        self.assertEqual(preproc_a["rows"], 6)
+        self.assertEqual(preproc_a["cols"], 10)
+        self.assertEqual(preproc_a["total_cells"], 60)
+
+        # Case B: Unframed tilted active grid where corner (0,0) and (5,9) are completely black (intensity 5)
+        unframed = generate_module_image(
+            rows=6,
+            cols=10,
+            outer_border_px=0,
+            defect_map={(0, 0): "dead", (5, 9): "dead"},
+            apply_perspective_tilt=False,
+        )
+        # Force dead corners to exact canvas background intensity (5)
+        unframed[:70, :70] = 5
+        unframed[-70:, -70:] = 5
+        rotated_unframed = _rotate_module_on_canvas(unframed, angle_deg=7.5, add_bench_noise=True)
+        quad = detect_panel_quadrilateral(rotated_unframed)
+        self.assertIsNotNone(quad)
+        self.assertEqual(quad.shape, (4, 2))
+        rectified_unframed = normalize_perspective(rotated_unframed)
+        r_u, c_u, _, _ = detect_grid_topology(rectified_unframed)
+        self.assertEqual(r_u, 6)
+        self.assertEqual(c_u, 10)
+
+        # Case C: Entire top border row (all 10 cells in row 0) is 100% dead/dark
+        all_top_row_dead = {(0, c): "dead" for c in range(10)}
+        panel_c = generate_module_image(
+            rows=6,
+            cols=10,
+            defect_map=all_top_row_dead,
+            apply_perspective_tilt=False,
+        )
+        r_c, c_c, y_b, x_b = detect_grid_topology(panel_c)
+        self.assertEqual(r_c, 6)
+        self.assertEqual(c_c, 10)
+        self.assertEqual(len(y_b), 7)
+        self.assertEqual(len(x_b), 11)
+
+    def test_standard_full_cell_vs_half_cut_with_central_gap(self):
+        """
+        Verify dynamic segmentation of Full-Cell (6x10) vs. Half-Cut (12x10 and 12x12)
+        modules with a wide central horizontal junction-box gap, checking spatial metadata.
+        """
+        # 1. Standard Full-Cell 6x10
+        full_cell_img = generate_module_image(rows=6, cols=10)
+        res_full = preprocess_el_module(full_cell_img)
+        self.assertEqual(res_full["rows"], 6)
+        self.assertEqual(res_full["cols"], 10)
+        self.assertEqual(res_full["total_cells"], 60)
+        self.assertEqual(res_full["panel_type"], "full-cell")
+
+        # 2. Half-Cut 12x10 (120 half-cells) with wide 22px central horizontal gap
+        half_cut_120 = _generate_half_cut_with_central_gap(
+            rows=12,
+            cols=10,
+            cell_w=60,
+            cell_h=35,
+            gap_px=4,
+            central_gap_px=22,
+            defect_map={(0, 2): "dead", (5, 4): "hot-spot", (6, 4): "micro-crack", (11, 9): "dead"},
+        )
+        res_hc120 = preprocess_el_module(half_cut_120)
+        self.assertEqual(res_hc120["rows"], 12)
+        self.assertEqual(res_hc120["cols"], 10)
+        self.assertEqual(res_hc120["total_cells"], 120)
+        self.assertEqual(res_hc120["panel_type"], "half-cut")
+        self.assertTrue(res_hc120["is_plausible_topology"])
+        self.assertEqual(len(res_hc120["cells"]), 120)
+
+        # 3. Half-Cut 12x12 (144 half-cells) with wide 22px central horizontal gap
+        half_cut_144 = _generate_half_cut_with_central_gap(
+            rows=12,
+            cols=12,
+            cell_w=56,
+            cell_h=34,
+            gap_px=4,
+            central_gap_px=22,
+        )
+        res_hc144 = preprocess_el_module(half_cut_144)
+        self.assertEqual(res_hc144["rows"], 12)
+        self.assertEqual(res_hc144["cols"], 12)
+        self.assertEqual(res_hc144["total_cells"], 144)
+        self.assertEqual(res_hc144["panel_type"], "half-cut")
+        self.assertTrue(res_hc144["is_plausible_topology"])
+
+        # Validate spatial traceability metadata dictionary structure on every cell
+        for expected_id, cell_meta in enumerate(res_hc120["cells"]):
+            self.assertEqual(set(cell_meta.keys()), {"cell_id", "row", "col", "bbox", "image"})
+            self.assertEqual(cell_meta["cell_id"], expected_id)
+            self.assertEqual(cell_meta["row"], expected_id // 10)
+            self.assertEqual(cell_meta["col"], expected_id % 10)
+            bbox = cell_meta["bbox"]
+            self.assertEqual(len(bbox), 4)
+            self.assertGreater(bbox[2], 0)
+            self.assertGreater(bbox[3], 0)
+            crop = cell_meta["image"]
+            self.assertIsInstance(crop, np.ndarray)
+            self.assertEqual(crop.dtype, np.uint8)
+            self.assertEqual(crop.shape, (bbox[3], bbox[2]))
+
+    def test_geometric_fallback_on_severe_noise(self):
+        """
+        Verify that when an image contains severe noise without discernible cell gaps,
+        detect_grid_topology falls back cleanly to standard aspect-ratio geometry.
+        """
+        rng = np.random.default_rng(42)
+        # Landscape ~1.67 aspect ratio noisy image -> should fallback to 6x10 (60 cells)
+        noisy_6x10 = rng.integers(90, 140, size=(480, 800), dtype=np.uint8)
+        rows, cols, y_b, x_b = detect_grid_topology(noisy_6x10)
+        self.assertEqual(rows, 6)
+        self.assertEqual(cols, 10)
+        self.assertEqual(len(y_b), 7)
+        self.assertEqual(len(x_b), 11)
+
+        # Landscape ~2.0 aspect ratio noisy image -> should fallback to 6x12 (72 cells)
+        noisy_6x12 = rng.integers(90, 140, size=(450, 900), dtype=np.uint8)
+        rows_72, cols_72, _, _ = detect_grid_topology(noisy_6x12)
+        self.assertEqual(rows_72, 6)
+        self.assertEqual(cols_72, 12)
+
     def test_yolo_classifier_loading_and_inference(self):
         """Verify YOLOv8-cls model loads and classifies single & batch cell crops correctly."""
         model = get_yolo_classifier()
@@ -135,22 +432,22 @@ class TestCVEngine(unittest.TestCase):
         model_hash = get_model_sha256()
         self.assertEqual(len(model_hash), 64)
 
-        # Test single inference on a 64x64 cell crop
-        dummy_cell = np.full((64, 64), 180, dtype=np.uint8)
-        is_defective, defect_type, confidence = classify_cell_yolo(dummy_cell, model=model)
+        # Verify preprocessed cell crops feed directly into YOLO without contract changes
+        sample_panel = generate_module_image(rows=6, cols=10, apply_perspective_tilt=True)
+        preproc = preprocess_el_module(sample_panel)
+        first_crop = preproc["cells"][0]["image"]
+        self.assertEqual(first_crop.dtype, np.uint8)
+
+        is_defective, defect_type, confidence = classify_cell_yolo(first_crop, model=model)
         self.assertIsInstance(is_defective, bool)
         self.assertIsInstance(defect_type, DefectType)
         self.assertGreaterEqual(confidence, 0.0)
         self.assertLessEqual(confidence, 1.0)
 
         # Test vectorized batch inference on multiple cell crops
-        batch_crops = [
-            np.full((64, 64), 180, dtype=np.uint8),
-            np.full((64, 64), 25, dtype=np.uint8),
-            np.full((64, 64, 3), 150, dtype=np.uint8)
-        ]
+        batch_crops = [c["image"] for c in preproc["cells"][:4]]
         batch_preds = classify_cells_batch_yolo(batch_crops, model=model)
-        self.assertEqual(len(batch_preds), 3)
+        self.assertEqual(len(batch_preds), 4)
         for pred_def, pred_type, pred_conf in batch_preds:
             self.assertIsInstance(pred_def, bool)
             self.assertIsInstance(pred_type, DefectType)
