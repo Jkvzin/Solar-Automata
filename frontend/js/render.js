@@ -258,6 +258,17 @@ function renderViewport() {
       img.src = url;
     }
     ga.style.backgroundImage = "url('" + ga.dataset.url + "')";
+  } else if ((m.image_url || m.presigned_url) && ga) {
+    state.zoom.raster = true;
+    if (rb) rb.hidden = true;
+    var remoteUrl = m.image_url || m.presigned_url;
+    ga.style.backgroundImage = "url('" + remoteUrl + "')";
+    ga.dataset.for = m.module_id;
+    if (m.image_width && m.image_height) {
+      state.zoom.natW = m.image_width;
+      state.zoom.natH = m.image_height;
+      plate.style.aspectRatio = String(m.image_width / m.image_height);
+    }
   } else if (ga) {
     state.zoom.raster = false;
     if (rb) rb.hidden = false;
@@ -550,11 +561,12 @@ function setDockTab(name) {
     var on = b.dataset.tab === name;
     b.setAttribute("aria-selected", on ? "true" : "false");
   });
-  var dp = $("#dockPayload"), dd = $("#dockDist"), dl = $("#dockLog"), dt = $("#dockTopology"), cb = $("#copyBtn");
+  var dp = $("#dockPayload"), dd = $("#dockDist"), dl = $("#dockLog"), dt = $("#dockTopology"), dh = $("#dockHistory"), cb = $("#copyBtn");
   if (dp) dp.hidden = name !== "payload";
   if (dd) dd.hidden = name !== "dist";
   if (dl) dl.hidden = name !== "log";
   if (dt) dt.hidden = name !== "topology";
+  if (dh) dh.hidden = name !== "history";
   if (cb) cb.style.visibility = name === "payload" ? "visible" : "hidden";
 
   try { if (history.replaceState) history.replaceState(null, "", "#" + name); } catch (e) {}
@@ -568,6 +580,8 @@ function setDockTab(name) {
     }
   } else if (name === "topology") {
     renderTopology();
+  } else if (name === "history") {
+    renderHistory();
   }
 }
 
@@ -711,6 +725,7 @@ function renderAll() {
   renderInspector();
   renderJson();
   renderTopology();
+  renderHistory();
   renderAuthUI();
   setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
   var dd = $("#dockDist");
@@ -718,6 +733,144 @@ function renderAll() {
     state.distValues = distData();
     drawDist(1);
   }
+}
+
+/* ---------- render: user analysis history & S3 gallery ---------- */
+function buildSyntheticThumbDataUri(item) {
+  var rows = +(item && item.rows) || 6;
+  var cols = +(item && item.cols) || 10;
+  var isFail = item && item.status === "FAIL";
+  var stroke = isFail ? "#F44747" : "#4EC9B0";
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 72" width="120" height="72">' +
+    '<rect width="120" height="72" fill="#141414"/>' +
+    '<rect x="4" y="4" width="112" height="64" fill="#1E1E1E" stroke="' + stroke + '" stroke-width="1"/>' +
+    '<text x="60" y="34" fill="#CCCCCC" font-family="monospace" font-size="9" text-anchor="middle">' + esc(item && item.module_id ? item.module_id : "EL SCAN") + '</text>' +
+    '<text x="60" y="48" fill="#858585" font-family="monospace" font-size="8" text-anchor="middle">GRADE ' + rows + 'x' + cols + '</text>' +
+    '</svg>';
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+}
+
+function formatHistoryTimestamp(isoStr) {
+  if (!isoStr) return "—";
+  try {
+    var d = new Date(isoStr);
+    if (isNaN(d.getTime())) return String(isoStr);
+    return d.toLocaleDateString("pt-BR") + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  } catch (e) {
+    return String(isoStr);
+  }
+}
+
+function renderHistory() {
+  var h = state.history || { items: [], loading: false, error: null, selectedItem: null };
+  var a = state.auth || {};
+  var grid = $("#historyGrid");
+  var tabCount = $("#historyTabCount");
+  var prefixBadge = $("#historyPrefixBadge");
+  var statusLabel = $("#historyStatusLabel");
+  var refreshBtn = $("#historyRefreshBtn");
+
+  var items = Array.isArray(h.items) ? h.items : [];
+  if (tabCount) {
+    tabCount.textContent = String(items.length);
+  }
+
+  if (prefixBadge) {
+    if (a.authenticated && a.user && a.user.user_id) {
+      prefixBadge.textContent = "s3://users/" + a.user.user_id + "/scans/*";
+    } else {
+      prefixBadge.textContent = "s3://anonymous/scans/* (não autenticado)";
+    }
+  }
+
+  if (refreshBtn) {
+    refreshBtn.disabled = !a.authenticated || !!h.loading;
+  }
+
+  if (!grid) return;
+
+  if (!a.authenticated || !a.user) {
+    if (statusLabel) statusLabel.textContent = "Minhas análises · Sessão não autenticada";
+    grid.innerHTML = '<div class="empty-mini history-empty">' +
+      'Autentique-se na barra superior (<strong>Autenticar</strong>) para sincronizar suas imagens EL e relatórios JSON particionados por operador no Amazon S3 (<span class="mono">users/{user_id}/</span>).' +
+      '<div style="margin-top:8px"><button type="button" class="btn" id="historyAuthPromptBtn">Entrar na sessão de operador</button></div>' +
+      '</div>';
+    var promptBtn = $("#historyAuthPromptBtn");
+    if (promptBtn) {
+      promptBtn.addEventListener("click", function() { openAuthModal("login"); });
+    }
+    return;
+  }
+
+  if (statusLabel) {
+    statusLabel.textContent = "Minhas análises · Operador " + (a.user.name || a.user.email) + " (" + items.length + " registro" + (items.length === 1 ? "" : "s") + ")";
+  }
+
+  if (h.loading) {
+    grid.innerHTML = '<div class="empty-mini history-empty">Sincronizando histórico de inspeções e gerando URLs pré-assinadas do Amazon S3...</div>';
+    return;
+  }
+
+  if (h.error) {
+    grid.innerHTML = '<div class="empty-mini history-empty" style="color:var(--defect-ink)">Falha ao consultar histórico: ' + esc(h.error) + '</div>';
+    return;
+  }
+
+  if (!items.length) {
+    grid.innerHTML = '<div class="empty-mini history-empty">' +
+      'Nenhuma inspeção persistida para <span class="mono">' + esc(a.user.email) + '</span>.<br>' +
+      'Ingira um lote de capturas EL para salvar automaticamente em <span class="mono">users/' + esc(a.user.user_id) + '/scans/</span>.' +
+      '</div>';
+    return;
+  }
+
+  grid.innerHTML = items.map(function(item) {
+    var modId = item.module_id || "—";
+    var isFail = item.status === "FAIL";
+    var isSelected = state.activeId === modId || h.selectedItem === modId;
+    var badgeHtml = isFail
+      ? '<span class="tag tag-fail">REPROVADO</span>'
+      : '<span class="tag tag-pass">APROVADO</span>';
+    var thumbSrc = item.image_url || item.presigned_url || item.rectified_image || buildSyntheticThumbDataUri(item);
+    var fallbackThumb = item.rectified_image || buildSyntheticThumbDataUri(item);
+    var presignedHref = item.image_url || item.presigned_url || "#";
+    var s3Key = item.s3_image_key || ("users/" + a.user.user_id + "/scans/" + (item.filename || modId));
+    var tsFormatted = formatHistoryTimestamp(item.timestamp);
+
+    return '<article class="history-card' + (isSelected ? ' is-selected' : '') + '" role="listitem" data-module-id="' + esc(modId) + '">' +
+      '<div class="history-thumb-wrap">' +
+        '<img class="history-thumb" src="' + esc(thumbSrc) + '" data-fallback="' + esc(fallbackThumb) + '" alt="Preview EL ' + esc(item.filename || modId) + '" loading="lazy" />' +
+        '<span class="history-thumb-badge">' + badgeHtml + '</span>' +
+      '</div>' +
+      '<div class="history-card-body">' +
+        '<div class="history-card-head">' +
+          '<strong class="mono history-mod-id" title="' + esc(modId) + '">' + esc(modId) + '</strong>' +
+          '<span class="mono history-dmg ' + (isFail ? 'is-fail' : 'is-pass') + '">dano ' + pct(item.module_damage_percentage) + '</span>' +
+        '</div>' +
+        '<div class="mono history-file" title="' + esc(item.filename || "") + '">' + esc(item.filename || "module.png") + '</div>' +
+        '<div class="mono history-meta">' +
+          '<span>' + (+item.defective_cells_count || 0) + '/' + (+item.total_cells || 0) + ' cél.</span>' +
+          '<span>grade ' + (+item.rows || 6) + '×' + (+item.cols || 10) + '</span>' +
+          '<span>' + esc(tsFormatted) + '</span>' +
+        '</div>' +
+        '<div class="mono history-s3-key" title="S3 Object Key: ' + esc(s3Key) + ' | Pre-signed URL ativa">' + esc(s3Key) + '</div>' +
+        '<div class="history-card-actions">' +
+          '<button type="button" class="btn history-load-btn" data-load-module="' + esc(modId) + '">Carregar no Inspetor</button>' +
+          '<button type="button" class="btn btn-icon history-del-btn" data-delete-module="' + esc(modId) + '" title="Remover inspeção do histórico" aria-label="Remover inspeção ' + esc(modId) + '">×</button>' +
+        '</div>' +
+      '</div>' +
+    '</article>';
+  }).join("");
+
+  // Attach image error fallback so S3 offline URLs in local dev degrade cleanly to SVG/rectified preview
+  $$("img.history-thumb", grid).forEach(function(imgEl) {
+    imgEl.addEventListener("error", function() {
+      var fb = imgEl.getAttribute("data-fallback");
+      if (fb && imgEl.src !== fb) {
+        imgEl.src = fb;
+      }
+    }, { once: true });
+  });
 }
 
 /* ---------- render: authentication UI & modal ---------- */

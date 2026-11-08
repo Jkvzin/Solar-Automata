@@ -540,8 +540,6 @@ def _extract_bearer_token(authorization: Optional[str], request: Optional[Reques
         parts = authorization.strip().split(" ", 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             return parts[1].strip()
-    if request and "luminapv_token" in request.cookies:
-        return request.cookies.get("luminapv_token")
     return None
 
 
@@ -579,6 +577,10 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"}
         )
     return user
+
+
+# Alias for standard FastAPI dependency naming convention
+get_current_active_user = get_current_user
 
 
 async def verify_optional_or_enforced_auth(

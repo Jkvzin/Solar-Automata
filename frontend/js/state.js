@@ -35,7 +35,14 @@ var state = {
     loading: false,
     mode: "login",
     error: null
-  }
+  },
+  history: {
+    items: [],
+    loading: false,
+    error: null,
+    selectedItem: null
+  },
+  data: null
 };
 
 /* ---------- formatting & string helpers ---------- */

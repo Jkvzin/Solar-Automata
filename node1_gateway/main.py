@@ -33,8 +33,10 @@ import redis.asyncio as aioredis
 
 try:
     from node1_gateway.auth import auth_router, verify_optional_or_enforced_auth, UserRecord
+    from node1_gateway.history import history_router, history_service
 except ImportError:
     from auth import auth_router, verify_optional_or_enforced_auth, UserRecord
+    from history import history_router, history_service
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +67,13 @@ except Exception as _boto_err:
     logger.debug(f"AWS Boto3 initialization bypassed: {_boto_err}")
     s3_client = None
     sqs_client = None
+
+# Bind dynamic S3/SQS providers to UserHistoryService so runtime/test mocks of s3_client are honored
+history_service._s3_client_provider = lambda: s3_client
+history_service._sqs_client_provider = lambda: sqs_client
+history_service.bucket_name = BUCKET_NAME
+history_service.aws_region = AWS_REGION
+history_service.queue_url = QUEUE_URL
 
 # Distributed Lock & Service Discovery Storage
 ACTIVE_LOCKS_KEY = "luminapv:active_locks"
@@ -365,6 +374,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(history_router)
 
 # Determine paths for frontend console and fixtures
 BASE_DIR = Path(__file__).resolve().parent
@@ -594,46 +604,17 @@ async def analyze_bulk(
             detail="No files received in multipart request key 'files'."
         )
 
-    # 1. AWS S3/SQS Ingestion (protegido e resiliente contra falha HTTP 500)
-    if AWS_INGESTION_ENABLED or (s3_client is not None and not isinstance(s3_client, type(None))):
-        uploaded_keys = []
-        for file in files:
-            try:
-                file_key = f"{uuid.uuid4()}-{file.filename}"
-                conteudo_imagem = await file.read()
-                arquivo_virtual = io.BytesIO(conteudo_imagem)
-
-                if s3_client is not None:
-                    s3_client.upload_fileobj(
-                        arquivo_virtual,
-                        BUCKET_NAME,
-                        file_key
-                    )
-                    uploaded_keys.append(file_key)
-
-                if sqs_client is not None:
-                    sqs_client.send_message(
-                        QueueUrl=QUEUE_URL,
-                        MessageBody=file_key
-                    )
-            except Exception as aws_err:
-                logger.warning(
-                    f"AWS ingestion fallback: failed to upload '{file.filename}' to S3/SQS ({aws_err}). "
-                    f"Continuing local/cluster processing."
-                )
-    else:
-        logger.debug("AWS ingestion disabled via configuration; processing entirely in-cluster.")
-
     logger.info(f"Initiating parallel bulk analysis for {len(files)} module scans...")
 
-    # 2. Carrega payloads dos arquivos em memória
+    # 1. Carrega payloads dos arquivos em memória e atribui scan_id único por arquivo
     file_payloads = []
     for f in files:
         await f.seek(0)
         content = await f.read()
-        file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png"))
+        scan_id = uuid.uuid4().hex[:12]
+        file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png", scan_id))
 
-    # 3. Resolução dinâmica de nomes e descoberta de workers no catálogo Redis
+    # 2. Resolução dinâmica de nomes e descoberta de workers no catálogo Redis
     healthy_endpoints = await resolver.get_healthy_endpoints()
 
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
@@ -674,7 +655,7 @@ async def analyze_bulk(
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
         tasks = []
         base_rr = resolver.rr_index
-        for idx, (content, name, ctype) in enumerate(file_payloads):
+        for idx, (content, name, ctype, _scan_id) in enumerate(file_payloads):
             target_url = healthy_endpoints[(base_rr + idx) % len(healthy_endpoints)]
             candidates = [target_url] + [u for u in healthy_endpoints if u != target_url]
             tasks.append(
@@ -685,16 +666,34 @@ async def analyze_bulk(
 
         resolver.rr_index += len(file_payloads)
         # Execução paralela balanceada entre workers
-        modules = await asyncio.gather(*tasks)
+        raw_modules = await asyncio.gather(*tasks)
 
-    # Ensure every module has a strictly unique module_id across the batch
+    # 3. Ensure unique module_id across batch & persist user-partitioned S3 objects + reports
     seen_ids = set()
-    for idx, m in enumerate(modules, start=1):
+    modules: List[Dict[str, Any]] = []
+    batch_ts = datetime.now(timezone.utc).isoformat()
+
+    for idx, raw_mod in enumerate(raw_modules, start=1):
+        m = dict(raw_mod) if isinstance(raw_mod, dict) else {}
         mid = m.get("module_id")
         if not mid or mid in seen_ids:
             mid = f"MOD-2026-{idx:03d}"
             m["module_id"] = mid
         seen_ids.add(mid)
+
+        content, name, ctype, scan_id = file_payloads[idx - 1]
+        if not m.get("timestamp"):
+            m["timestamp"] = batch_ts
+
+        await history_service.persist_module_inspection(
+            module_data=m,
+            image_bytes=content,
+            filename=name,
+            content_type=ctype,
+            user=current_user,
+            scan_id=scan_id
+        )
+        modules.append(m)
 
     # Compute batch-wide aggregated telemetry
     total_modules = len(modules)
