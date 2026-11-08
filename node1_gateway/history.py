@@ -405,13 +405,7 @@ class UserHistoryService:
         existing_items, _ = await self.list_user_history(user_id=user.user_id, limit=500, offset=0)
         existing_scan_ids = {item.get("scan_id") for item in existing_items if item.get("scan_id")}
 
-        for mod in modules or []:
-            if not isinstance(mod, dict):
-                continue
-            scan_uid = str(mod.get("scan_id") or "").strip() or uuid.uuid4().hex[:12]
-            if scan_uid in existing_scan_ids:
-                continue
-
+        async def _sync_single_module(mod: Dict[str, Any], scan_uid: str) -> None:
             mod_id = str(mod.get("module_id") or f"MOD-2026-{scan_uid[:6].upper()}")
             filename = str(mod.get("filename") or f"{mod_id}.png")
 
@@ -442,8 +436,20 @@ class UserHistoryService:
                 user=user,
                 scan_id=scan_uid
             )
-            existing_scan_ids.add(scan_uid)
             await self.memory_repo.delete_record("anonymous", mod_id)
+
+        sync_tasks = []
+        for mod in modules or []:
+            if not isinstance(mod, dict):
+                continue
+            scan_uid = str(mod.get("scan_id") or "").strip() or uuid.uuid4().hex[:12]
+            if scan_uid in existing_scan_ids:
+                continue
+            existing_scan_ids.add(scan_uid)
+            sync_tasks.append(_sync_single_module(mod, scan_uid))
+
+        if sync_tasks:
+            await asyncio.gather(*sync_tasks)
 
         return await self.list_user_history(user_id=user.user_id, limit=100, offset=0)
 
