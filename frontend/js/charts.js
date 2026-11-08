@@ -85,7 +85,7 @@ function drawSpark() {
   sparkPts.forEach(function(pt) {
     p.ctx.beginPath();
     p.ctx.rect(pt.x - 1.5, pt.y - 1.5, 3, 3);
-    p.ctx.fillStyle = (pt.value !== "—" && parseFloat(String(pt.value).replace(",", ".")) >= 15) ? defect : accent;
+    p.ctx.fillStyle = (pt.value !== "--" && parseFloat(String(pt.value).replace(",", ".")) >= 15) ? defect : accent;
     p.ctx.fill();
   });
 }
