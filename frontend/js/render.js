@@ -480,9 +480,13 @@ function renderInspector() {
   var insNode = $("#insNode");
   if (insNode) {
     if (m) {
-      var nName = m.processed_by_node || "worker-1";
-      var isL = state.cluster && state.cluster.leader_id && (nName.indexOf(state.cluster.leader_id) >= 0 || nName === state.cluster.leader_id);
-      insNode.innerHTML = '<span class="mono">' + esc(nName) + '</span>' + (isL ? ' <span class="tag-leader" style="font-size:8.5px">LÍDER</span>' : ' <span class="tag-replica" style="font-size:8.5px">RÉPLICA</span>');
+      var nName = m.processed_by_node;
+      if (nName) {
+        var isL = state.cluster && state.cluster.leader_id && (nName.indexOf(state.cluster.leader_id) >= 0 || nName === state.cluster.leader_id);
+        insNode.innerHTML = '<span class="mono">' + esc(nName) + '</span>' + (isL ? ' <span class="tag-leader" style="font-size:8.5px">LÍDER</span>' : ' <span class="tag-replica" style="font-size:8.5px">RÉPLICA</span>');
+      } else {
+        insNode.innerHTML = '<span class="mono" style="color:var(--muted2)">—</span>';
+      }
     } else {
       insNode.textContent = "—";
     }
@@ -630,7 +634,11 @@ function renderTopology() {
         var roleBadge = isLeader ? '<span class="tag-leader">LÍDER</span>' : '<span class="tag-replica">RÉPLICA</span>';
         var statusBadge = isOnline ? '<span class="tag tag-pass">ONLINE</span>' : '<span class="tag tag-fail">OFFLINE</span>';
         var shaShort = n.model_sha256 ? ('<span title="' + esc(n.model_sha256) + '" class="mono">' + esc(n.model_sha256.slice(0, 10)) + '…</span>') : '<span class="mono" style="color:var(--muted2)">—</span>';
-        var lastSeen = n.last_seen ? new Date(n.last_seen * 1000).toLocaleTimeString("pt-BR") : "ativo agora";
+        var lastSeen = "ativo agora";
+        if (n.last_seen) {
+          var d = isNaN(n.last_seen) ? new Date(n.last_seen) : new Date(Number(n.last_seen) * 1000);
+          lastSeen = !isNaN(d.getTime()) ? d.toLocaleTimeString("pt-BR") : "ativo agora";
+        }
         return '<tr>' +
           '<td><strong>' + esc(n.node_id || "—") + '</strong></td>' +
           '<td class="mono">' + esc(n.dns_name || (n.node_id + ".luminapv.local")) + '</td>' +
