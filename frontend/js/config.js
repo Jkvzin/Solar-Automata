@@ -10,6 +10,7 @@ var AUTH_LOGIN_ENDPOINT = "/api/auth/login";
 var AUTH_REGISTER_ENDPOINT = "/api/auth/register";
 var AUTH_LOGOUT_ENDPOINT = "/api/auth/logout";
 var AUTH_ME_ENDPOINT = "/api/auth/me";
+var HISTORY_ENDPOINT = "/api/v1/user/history";
 var SAMPLE_PAYLOAD = "fixtures/luminapv-batch-sample.json";
 var TIMEOUT_MS = 60000;
 var SLOW_MS = 15000;

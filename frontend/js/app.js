@@ -475,6 +475,34 @@ function initEvents() {
     });
   }
 
+  var historyRefreshBtn = $("#historyRefreshBtn");
+  if (historyRefreshBtn) {
+    historyRefreshBtn.addEventListener("click", function() {
+      if (typeof fetchUserHistory === "function") fetchUserHistory();
+    });
+  }
+
+  var historyGrid = $("#historyGrid");
+  if (historyGrid) {
+    historyGrid.addEventListener("click", function(e) {
+      var loadBtn = e.target.closest("[data-load-module]");
+      if (loadBtn) {
+        var modId = loadBtn.getAttribute("data-load-module");
+        if (modId && typeof loadHistoricalModule === "function") {
+          loadHistoricalModule(modId);
+        }
+        return;
+      }
+      var delBtn = e.target.closest("[data-delete-module]");
+      if (delBtn) {
+        var delId = delBtn.getAttribute("data-delete-module");
+        if (delId && typeof deleteHistoricalModule === "function") {
+          deleteHistoricalModule(delId);
+        }
+      }
+    });
+  }
+
   window.addEventListener("resize", debounce(function() {
     fitPlate();
     applyTransform();
@@ -505,7 +533,7 @@ function boot() {
   if (tb) tb.setAttribute("aria-pressed", light ? "true" : "false");
 
   var hash = (window.location.hash || "#payload").slice(1);
-  setDockTab(["payload", "dist", "topology", "log"].indexOf(hash) >= 0 ? hash : "payload");
+  setDockTab(["payload", "dist", "topology", "history", "log"].indexOf(hash) >= 0 ? hash : "payload");
 
   try {
     var savedFilter = localStorage.getItem("luminapv.filter");

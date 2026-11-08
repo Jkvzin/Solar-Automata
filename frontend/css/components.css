@@ -1225,3 +1225,178 @@ canvas.dist {
   padding-top: 4px;
   border-top: 1px solid var(--border);
 }
+
+/* ---------- user analysis history & S3 image gallery ---------- */
+.tab-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 9.5px;
+  line-height: 14px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  color: var(--fg);
+}
+
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-toolbar .btn {
+  height: 22px;
+  font-size: 11px;
+  padding: 0 8px;
+}
+
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+  gap: 8px;
+}
+
+.history-empty {
+  grid-column: 1 / -1;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.history-card {
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+
+.history-card:hover {
+  background: var(--hover);
+  border-color: var(--border-strong);
+}
+
+.history-card.is-selected {
+  background: var(--sel);
+  border-color: var(--focus);
+}
+
+.history-thumb-wrap {
+  position: relative;
+  flex: 0 0 84px;
+  width: 84px;
+  height: 64px;
+  background: var(--raster-bg);
+  border: 1px solid var(--border-strong);
+  overflow: hidden;
+}
+
+.history-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.history-thumb-badge {
+  position: absolute;
+  left: 3px;
+  bottom: 3px;
+}
+
+.history-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.history-mod-id {
+  font-size: 11.5px;
+  color: var(--fg-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-dmg {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.history-dmg.is-fail {
+  color: var(--defect-ink);
+}
+
+.history-dmg.is-pass {
+  color: var(--pass);
+}
+
+.history-file {
+  font-size: 10px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 9.5px;
+  color: var(--muted2);
+}
+
+.history-s3-key {
+  font-size: 9px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+.history-load-btn {
+  flex: 1 1 auto;
+  height: 22px;
+  font-size: 10.5px;
+  justify-content: center;
+}
+
+.history-del-btn {
+  width: 22px;
+  height: 22px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--muted2);
+}
+
+.history-del-btn:hover:not(:disabled) {
+  color: var(--defect-ink);
+  border-color: var(--defect);
+}

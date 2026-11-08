@@ -79,6 +79,7 @@ function ingestPayload(data, source) {
   if (state.summary.defective_modules_count === undefined) {
     state.summary.defective_modules_count = modules.filter(function(m) { return m.status === "FAIL"; }).length;
   }
+  state.data = { batch_summary: state.summary, modules: state.modules };
   var prev = state.activeId;
   state.activeId = (prev && moduleById(prev)) ? prev : (modules.length ? modules[0].module_id : null);
   state.selectedCell = null;
@@ -218,6 +219,9 @@ function postBulk(files) {
       }
       ingestPayload(data, "HTTP " + status);
       pollClusterStatus();
+      if (state.auth && state.auth.authenticated && typeof fetchUserHistory === "function") {
+        fetchUserHistory();
+      }
       return data;
     });
   }).catch(function(e) {
@@ -505,11 +509,18 @@ function clearAuthSession() {
   state.auth.user = null;
   state.auth.authenticated = false;
   state.auth.error = null;
+  if (state.history) {
+    state.history.items = [];
+    state.history.loading = false;
+    state.history.error = null;
+    state.history.selectedItem = null;
+  }
   try {
     localStorage.removeItem("luminapv.auth.token");
     localStorage.removeItem("luminapv.auth.user");
   } catch (e) {}
   if (typeof renderAuthUI === "function") renderAuthUI();
+  if (typeof renderHistory === "function") renderHistory();
 }
 
 function authLogin(email, password) {
@@ -537,6 +548,7 @@ function authLogin(email, password) {
       log("ok", "Operador autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "] · storage=" + (data.user.storage_backend || "memory"));
       live("Sessão iniciada como " + data.user.name);
       if (typeof closeAuthModal === "function") closeAuthModal();
+      if (typeof fetchUserHistory === "function") fetchUserHistory();
       return data;
     })
     .catch(function(err) {
@@ -578,6 +590,7 @@ function authRegister(name, email, password, role) {
       log("ok", "Novo operador cadastrado e autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "]");
       live("Cadastro concluído. Sessão iniciada como " + data.user.name);
       if (typeof closeAuthModal === "function") closeAuthModal();
+      if (typeof fetchUserHistory === "function") fetchUserHistory();
       return data;
     })
     .catch(function(err) {
@@ -642,11 +655,171 @@ function authVerifySession() {
     .then(function(userDto) {
       if (userDto && userDto.email) {
         saveAuthSession(savedToken, userDto);
+        if (typeof fetchUserHistory === "function") fetchUserHistory();
       }
       return userDto;
     })
     .catch(function() {
       // Graceful degradation when running standalone HTML without backend
       return savedUser;
+    });
+}
+
+/* ---------- user analysis history & S3 gallery ---------- */
+function fetchUserHistory(limit) {
+  if (!state.auth || !state.auth.authenticated || !state.auth.token) {
+    if (state.history) {
+      state.history.items = [];
+      state.history.loading = false;
+      state.history.error = null;
+    }
+    if (typeof renderHistory === "function") renderHistory();
+    return Promise.resolve([]);
+  }
+
+  var endpoint = (typeof HISTORY_ENDPOINT !== "undefined" ? HISTORY_ENDPOINT : "/api/v1/user/history");
+  var maxItems = limit || 50;
+  state.history.loading = true;
+  state.history.error = null;
+  if (typeof renderHistory === "function") renderHistory();
+
+  return fetch(endpoint + "?limit=" + encodeURIComponent(maxItems), {
+    method: "GET",
+    headers: { "Authorization": "Bearer " + state.auth.token },
+    cache: "no-store"
+  })
+    .then(function(res) {
+      if (res.status === 401 || res.status === 403) {
+        state.history.loading = false;
+        state.history.error = "Sessão não autorizada para consultar histórico.";
+        if (typeof renderHistory === "function") renderHistory();
+        return [];
+      }
+      if (!res.ok) {
+        throw new Error("HTTP " + res.status);
+      }
+      return res.json();
+    })
+    .then(function(body) {
+      var list = [];
+      if (Array.isArray(body)) {
+        list = body;
+      } else if (body && Array.isArray(body.items)) {
+        list = body.items;
+      } else if (body && Array.isArray(body.history)) {
+        list = body.history;
+      }
+      state.history.items = list;
+      state.history.loading = false;
+      state.history.error = null;
+      if (typeof renderHistory === "function") renderHistory();
+      return list;
+    })
+    .catch(function(err) {
+      state.history.loading = false;
+      state.history.error = (err && err.message) ? err.message : "Falha ao carregar histórico.";
+      if (typeof renderHistory === "function") renderHistory();
+      return [];
+    });
+}
+
+function loadHistoricalModule(moduleId) {
+  if (!moduleId) return Promise.resolve(null);
+  var endpoint = (typeof HISTORY_ENDPOINT !== "undefined" ? HISTORY_ENDPOINT : "/api/v1/user/history");
+  var headers = {};
+  if (state.auth && state.auth.token) {
+    headers["Authorization"] = "Bearer " + state.auth.token;
+  }
+
+  function applyHistoricalModuleToStage(modObj) {
+    if (!modObj || typeof modObj !== "object") return null;
+    state.history.selectedItem = modObj.module_id;
+
+    // Preserve existing batch modules or upsert the historical module so inspector & charts work seamlessly
+    var existingIdx = -1;
+    for (var i = 0; i < state.modules.length; i++) {
+      if (state.modules[i].module_id === modObj.module_id) {
+        existingIdx = i;
+        break;
+      }
+    }
+    var updatedModules = state.modules.slice();
+    if (existingIdx >= 0) {
+      updatedModules[existingIdx] = modObj;
+    } else {
+      updatedModules.unshift(modObj);
+    }
+
+    var totalMods = updatedModules.length;
+    var failMods = updatedModules.filter(function(m) { return m.status === "FAIL"; }).length;
+    var dmgSum = updatedModules.reduce(function(acc, m) { return acc + (+m.module_damage_percentage || 0); }, 0);
+    var summary = {
+      total_modules: totalMods,
+      defective_modules_count: failMods,
+      batch_failure_percentage: totalMods ? Number(((failMods / totalMods) * 100).toFixed(1)) : 0,
+      average_cell_degradation_percentage: totalMods ? Number((dmgSum / totalMods).toFixed(1)) : 0
+    };
+
+    state.activeId = modObj.module_id;
+    ingestPayload({ batch_summary: summary, modules: updatedModules }, "Histórico S3 · " + modObj.module_id);
+    selectModule(modObj.module_id);
+    if (typeof renderHistory === "function") renderHistory();
+    live("Módulo histórico " + modObj.module_id + " carregado no inspetor óptico.");
+    return modObj;
+  }
+
+  return fetch(endpoint + "/" + encodeURIComponent(moduleId), {
+    method: "GET",
+    headers: headers,
+    cache: "no-store"
+  })
+    .then(function(res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    })
+    .then(function(detail) {
+      return applyHistoricalModuleToStage(detail);
+    })
+    .catch(function() {
+      // Fallback to cached item in state.history.items if detail endpoint is unreachable
+      var localMatch = null;
+      if (state.history && Array.isArray(state.history.items)) {
+        for (var i = 0; i < state.history.items.length; i++) {
+          if (state.history.items[i].module_id === moduleId) {
+            localMatch = state.history.items[i];
+            break;
+          }
+        }
+      }
+      if (localMatch) {
+        return applyHistoricalModuleToStage(localMatch);
+      }
+      log("error", "Não foi possível carregar o módulo histórico " + moduleId);
+      return null;
+    });
+}
+
+function deleteHistoricalModule(moduleId) {
+  if (!moduleId || !state.auth || !state.auth.token) return Promise.resolve(false);
+  var endpoint = (typeof HISTORY_ENDPOINT !== "undefined" ? HISTORY_ENDPOINT : "/api/v1/user/history");
+  return fetch(endpoint + "/" + encodeURIComponent(moduleId), {
+    method: "DELETE",
+    headers: { "Authorization": "Bearer " + state.auth.token }
+  })
+    .then(function(res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      state.history.items = (state.history.items || []).filter(function(it) {
+        return it.module_id !== moduleId;
+      });
+      if (state.history.selectedItem === moduleId) {
+        state.history.selectedItem = null;
+      }
+      log("info", "Inspeção " + moduleId + " removida do histórico S3 do operador.");
+      if (typeof renderHistory === "function") renderHistory();
+      return true;
+    })
+    .catch(function(err) {
+      log("error", "Falha ao remover inspeção " + moduleId + " do histórico: " + (err && err.message ? err.message : "erro"));
+      return false;
     });
 }

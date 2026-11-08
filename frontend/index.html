@@ -183,6 +183,7 @@
         <button type="button" role="tab" id="tab-payload" aria-selected="true" aria-controls="dockPayload" data-tab="payload">Payload bruto</button>
         <button type="button" role="tab" id="tab-dist" aria-selected="false" aria-controls="dockDist" data-tab="dist">Distribuição de defeitos</button>
         <button type="button" role="tab" id="tab-topology" aria-selected="false" aria-controls="dockTopology" data-tab="topology">Topologia do cluster</button>
+        <button type="button" role="tab" id="tab-history" aria-selected="false" aria-controls="dockHistory" data-tab="history">Histórico <span class="tab-badge mono" id="historyTabCount">0</span></button>
         <button type="button" role="tab" id="tab-log" aria-selected="false" aria-controls="dockLog" data-tab="log">Log do lote</button>
       </div>
       <span class="spacer"></span>
@@ -250,6 +251,17 @@
             <span id="topoActiveLocks">Locks Distribuídos Ativos: Nenhum (seção crítica livre)</span>
             <span id="topoClusterTime" class="mono">Cluster: Sincronizado</span>
           </div>
+        </div>
+      </div>
+      <div id="dockHistory" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="history-panel" id="historyPanel">
+          <div class="history-toolbar">
+            <span class="sec-label" id="historyStatusLabel">Minhas análises · Partição S3 por operador</span>
+            <span class="spacer"></span>
+            <span class="mono" style="font-size:10px;color:var(--muted2)" id="historyPrefixBadge">s3://.../users/—</span>
+            <button type="button" class="btn" id="historyRefreshBtn" title="Sincronizar histórico de análises do S3">Atualizar histórico</button>
+          </div>
+          <div class="history-grid" id="historyGrid" role="list" aria-label="Galeria de análises anteriores do operador"></div>
         </div>
       </div>
       <div id="dockLog" role="tabpanel" aria-labelledby="tab-log" hidden>

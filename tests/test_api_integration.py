@@ -715,6 +715,214 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(fetched_by_email.user_id, "usr-test-s3-001")
         self.assertEqual(fetched_by_email.role, "admin")
 
+    # -------------------------------------------------------------------------
+    # User Analysis History & S3 Image Gallery Tests
+    # -------------------------------------------------------------------------
+    def test_user_bulk_upload_partitions_by_user_id(self):
+        """Confirms S3 put_object is called with keys starting with users/<user_id>/ when authenticated, and anonymous/ when unauthenticated."""
+        asyncio.run(gateway_module.history_service.memory_repo.clear())
+        self.mock_s3.put_object.reset_mock()
+        self.mock_s3.put_object.side_effect = None
+
+        login_resp = self.gateway_client.post(
+            "/api/auth/login",
+            json={"email": "operador@luminapv.local", "password": "LuminaPV@2026"},
+        )
+        self.assertEqual(login_resp.status_code, 200)
+        login_data = login_resp.json()
+        token = login_data["access_token"]
+        user_id = login_data["user"]["user_id"]
+
+        async def mock_worker_dispatch(client, file_bytes, filename, content_type, **kwargs):
+            return {
+                "module_id": "MOD-PART-001",
+                "filename": filename,
+                "status": "FAIL",
+                "rows": 6,
+                "cols": 10,
+                "total_cells": 60,
+                "defective_cells_count": 3,
+                "module_damage_percentage": 5.0,
+                "processed_by_node": "worker-1",
+                "cells": [{"index": 0, "row": 0, "col": 0, "is_defective": True, "defect_type": "micro-crack", "confidence": 0.92}],
+            }
+
+        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=mock_worker_dispatch):
+            files = [("files", ("module_el_01.png", b"raw_image_bytes_01", "image/png"))]
+            resp = self.gateway_client.post(
+                "/api/v1/analyze/bulk",
+                files=files,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            body = resp.json()
+            self.assertEqual(len(body["modules"]), 1)
+            mod = body["modules"][0]
+            self.assertTrue(mod["s3_image_key"].startswith(f"users/{user_id}/scans/"))
+            self.assertTrue(mod["s3_report_key"].startswith(f"users/{user_id}/reports/"))
+
+            put_keys = [
+                call.kwargs.get("Key") or (call.args[1] if len(call.args) > 1 else "")
+                for call in self.mock_s3.put_object.call_args_list
+            ]
+            self.assertTrue(any(k.startswith(f"users/{user_id}/scans/") and k.endswith("_module_el_01.png") for k in put_keys))
+            self.assertTrue(any(k.startswith(f"users/{user_id}/reports/") and k.endswith("_MOD-PART-001.json") for k in put_keys))
+
+            # Verify anonymous fallback partitioning when no token is provided
+            self.mock_s3.put_object.reset_mock()
+            anon_resp = self.gateway_client.post(
+                "/api/v1/analyze/bulk",
+                files=[("files", ("anon_scan.png", b"anon_bytes", "image/png"))],
+            )
+            self.assertEqual(anon_resp.status_code, 200)
+            anon_keys = [
+                call.kwargs.get("Key") or (call.args[1] if len(call.args) > 1 else "")
+                for call in self.mock_s3.put_object.call_args_list
+            ]
+            self.assertTrue(any(k.startswith("anonymous/scans/") for k in anon_keys))
+            self.assertTrue(any(k.startswith("anonymous/reports/") for k in anon_keys))
+
+    def test_get_user_history_requires_auth(self):
+        """Confirms HTTP 401 when accessing /api/v1/user/history without a valid Bearer JWT token."""
+        resp_list = self.gateway_client.get("/api/v1/user/history")
+        self.assertEqual(resp_list.status_code, 401)
+
+        resp_detail = self.gateway_client.get("/api/v1/user/history/MOD-2026-001")
+        self.assertEqual(resp_detail.status_code, 401)
+
+        resp_delete = self.gateway_client.delete("/api/v1/user/history/MOD-2026-001")
+        self.assertEqual(resp_delete.status_code, 401)
+
+    def test_get_user_history_returns_user_scans(self):
+        """Verifies that history returns only the scans belonging to the logged-in operator, with pre-signed S3 URLs, full detail reload, and deletion."""
+        asyncio.run(gateway_module.history_service.memory_repo.clear())
+
+        # Authenticate Operator 1 (default operator)
+        login_op1 = self.gateway_client.post(
+            "/api/auth/login",
+            json={"email": "operador@luminapv.local", "password": "LuminaPV@2026"},
+        )
+        self.assertEqual(login_op1.status_code, 200)
+        token_op1 = login_op1.json()["access_token"]
+        uid_op1 = login_op1.json()["user"]["user_id"]
+
+        # Register & authenticate Operator 2
+        reg_op2 = self.gateway_client.post(
+            "/api/auth/register",
+            json={
+                "name": "Operador Dois",
+                "email": "op2.history@luminapv.local",
+                "password": "Op2Password!2026",
+                "role": "operator",
+            },
+        )
+        if reg_op2.status_code == 409:
+            reg_op2 = self.gateway_client.post(
+                "/api/auth/login",
+                json={"email": "op2.history@luminapv.local", "password": "Op2Password!2026"},
+            )
+        self.assertIn(reg_op2.status_code, (200, 201))
+        token_op2 = reg_op2.json()["access_token"]
+        uid_op2 = reg_op2.json()["user"]["user_id"]
+
+        self.mock_s3.generate_presigned_url.side_effect = (
+            lambda method, Params, ExpiresIn=3600: f"https://{Params['Bucket']}.s3.us-east-2.amazonaws.com/{Params['Key']}?X-Amz-Expires={ExpiresIn}&sig=mock"
+        )
+
+        async def mock_worker_dispatch(client, file_bytes, filename, content_type, **kwargs):
+            mod_id = "MOD-OP1-SCAN" if "op1" in filename else "MOD-OP2-SCAN"
+            return {
+                "module_id": mod_id,
+                "filename": filename,
+                "status": "FAIL" if "op1" in filename else "PASS",
+                "rows": 6,
+                "cols": 10,
+                "total_cells": 60,
+                "defective_cells_count": 4 if "op1" in filename else 0,
+                "module_damage_percentage": 6.7 if "op1" in filename else 0.0,
+                "processed_by_node": "worker-1",
+                "cells": [
+                    {
+                        "index": 12,
+                        "row": 1,
+                        "col": 2,
+                        "is_defective": True,
+                        "defect_type": "micro-crack",
+                        "confidence": 0.94,
+                        "bbox": {"x": 10, "y": 20, "width": 50, "height": 50, "x_pct": 20.0, "y_pct": 16.6, "width_pct": 10.0, "height_pct": 16.6},
+                    }
+                ] if "op1" in filename else [],
+            }
+
+        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=mock_worker_dispatch):
+            # Upload scan as Operator 1
+            up1 = self.gateway_client.post(
+                "/api/v1/analyze/bulk",
+                files=[("files", ("op1_panel.png", b"op1_img_bytes", "image/png"))],
+                headers={"Authorization": f"Bearer {token_op1}"},
+            )
+            self.assertEqual(up1.status_code, 200)
+
+            # Upload scan as Operator 2
+            up2 = self.gateway_client.post(
+                "/api/v1/analyze/bulk",
+                files=[("files", ("op2_panel.png", b"op2_img_bytes", "image/png"))],
+                headers={"Authorization": f"Bearer {token_op2}"},
+            )
+            self.assertEqual(up2.status_code, 200)
+
+        # Operator 1 fetches their history -> must only see MOD-OP1-SCAN
+        hist_op1 = self.gateway_client.get(
+            "/api/v1/user/history?limit=50",
+            headers={"Authorization": f"Bearer {token_op1}"},
+        )
+        self.assertEqual(hist_op1.status_code, 200)
+        hist_data_1 = hist_op1.json()
+        self.assertEqual(hist_data_1["user_id"], uid_op1)
+        self.assertEqual(len(hist_data_1["items"]), 1)
+        item1 = hist_data_1["items"][0]
+        self.assertEqual(item1["module_id"], "MOD-OP1-SCAN")
+        self.assertEqual(item1["filename"], "op1_panel.png")
+        self.assertTrue(item1["s3_image_key"].startswith(f"users/{uid_op1}/scans/"))
+        self.assertIn(f"users/{uid_op1}/scans/", item1["image_url"])
+        self.assertIn("X-Amz-Expires=3600", item1["presigned_url"])
+
+        # Operator 1 fetches full module detail for interactive canvas reload
+        detail_op1 = self.gateway_client.get(
+            "/api/v1/user/history/MOD-OP1-SCAN",
+            headers={"Authorization": f"Bearer {token_op1}"},
+        )
+        self.assertEqual(detail_op1.status_code, 200)
+        detail_json = detail_op1.json()
+        self.assertEqual(detail_json["module_id"], "MOD-OP1-SCAN")
+        self.assertEqual(len(detail_json["cells"]), 1)
+        self.assertEqual(detail_json["cells"][0]["defect_type"], "micro-crack")
+
+        # Operator 1 cannot access Operator 2's module detail
+        forbidden_detail = self.gateway_client.get(
+            "/api/v1/user/history/MOD-OP2-SCAN",
+            headers={"Authorization": f"Bearer {token_op1}"},
+        )
+        self.assertEqual(forbidden_detail.status_code, 404)
+
+        # Operator 1 deletes their scan
+        del_resp = self.gateway_client.delete(
+            "/api/v1/user/history/MOD-OP1-SCAN",
+            headers={"Authorization": f"Bearer {token_op1}"},
+        )
+        self.assertEqual(del_resp.status_code, 200)
+        self.assertEqual(del_resp.json()["status"], "deleted")
+
+        # History for Operator 1 is now empty
+        hist_after_del = self.gateway_client.get(
+            "/api/v1/user/history",
+            headers={"Authorization": f"Bearer {token_op1}"},
+        )
+        self.assertEqual(hist_after_del.status_code, 200)
+        self.assertEqual(len(hist_after_del.json()["items"]), 0)
+
+        self.mock_s3.generate_presigned_url.side_effect = None
+
 
 if __name__ == "__main__":
     unittest.main()
