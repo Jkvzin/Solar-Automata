@@ -1205,6 +1205,14 @@ canvas.dist {
   gap: 4px;
 }
 
+.auth-field[hidden] {
+  display: none !important;
+}
+
+[hidden] {
+  display: none !important;
+}
+
 .auth-input {
   height: 28px;
   padding: 0 8px;
