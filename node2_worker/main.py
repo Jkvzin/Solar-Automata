@@ -8,6 +8,7 @@ and manages distributed Primary-Backup result replication & inference caching.
 """
 
 import asyncio
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -41,6 +42,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://state.luminapv.local:6379/0")
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3.0"))
 HEARTBEAT_TTL_SECONDS = int(os.getenv("HEARTBEAT_TTL_SECONDS", "10"))
 REPLICA_TTL_SECONDS = int(os.getenv("REPLICA_TTL_SECONDS", "3600"))
+MAX_LOCAL_REPLICAS = int(os.getenv("MAX_LOCAL_REPLICAS", "500"))
 
 REGISTRY_KEY_PREFIX = "luminapv:services:vision-worker"
 REPLICA_KEY_PREFIX = "luminapv:replica:module"
@@ -51,9 +53,39 @@ LEADER_TERM_KEY = "luminapv:leader:term"
 LEADER_LEASE_TTL_SECONDS = int(os.getenv("LEADER_LEASE_TTL_SECONDS", "8"))
 ELECTION_CHECK_INTERVAL_SECONDS = float(os.getenv("ELECTION_CHECK_INTERVAL_SECONDS", "2.0"))
 
+
+class LRUReplicaStore(OrderedDict):
+    """
+    Armazenamento em memória com política de descarte LRU (Least Recently Used)
+    baseado em collections.OrderedDict para evitar crescimento ilimitado de RAM
+    no fallback local de réplicas.
+    """
+
+    def __init__(self, max_size: int = MAX_LOCAL_REPLICAS, *args: Any, **kwargs: Any) -> None:
+        self.max_size: int = max(1, int(max_size))
+        super().__init__(*args, **kwargs)
+
+    def __getitem__(self, key: str) -> Dict[str, Any]:
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self:
+            return self[key]
+        return default
+
+    def __setitem__(self, key: str, value: Dict[str, Any]) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_size:
+            self.popitem(last=False)
+
+
 # Fallback in-memory stores for standalone or unit-test environments without Redis
 _LOCAL_REGISTRY_FALLBACK: Dict[str, Dict[str, Any]] = {}
-_LOCAL_REPLICA_STORE: Dict[str, Dict[str, Any]] = {}
+_LOCAL_REPLICA_STORE: LRUReplicaStore = LRUReplicaStore(max_size=MAX_LOCAL_REPLICAS)
 _LOCAL_LEADER_STATE: Dict[str, Any] = {
     "leader_id": None,
     "term": 1,
@@ -176,6 +208,7 @@ class WorkerServiceRegistry:
         if self.redis_client is not None:
             try:
                 await self.redis_client.delete(f"{REGISTRY_KEY_PREFIX}:{self.node_id}")
+                await self.redis_client.srem(f"{REGISTRY_KEY_PREFIX}:nodes", self.node_id)
                 await self.redis_client.close()
             except Exception:
                 pass
@@ -290,14 +323,26 @@ class DistributedResultReplicator:
             self.cache_misses += 1
             return None
 
-        self.cache_hits += 1
         cloned = dict(raw_data)
         cloned["filename"] = filename
         cloned["module_id"] = generate_module_id(filename)
         cloned["replicated"] = True
         cloned["cache_hit"] = True
         cloned["consistency_model"] = self.consistency_model
-        return ModuleResult(**cloned)
+        try:
+            result_obj = ModuleResult(**cloned)
+        except Exception as exc:
+            logger.warning(
+                f"Invalidando cache para '{filename}' devido a incompatibilidade de schema ({exc}); "
+                f"tratando como cache miss."
+            )
+            _LOCAL_REPLICA_STORE.pop(content_key, None)
+            _LOCAL_REPLICA_STORE.pop(content_sha256, None)
+            self.cache_misses += 1
+            return None
+
+        self.cache_hits += 1
+        return result_obj
 
     async def get_replica_by_sha256(self, content_sha256: str) -> Optional[Dict[str, Any]]:
         """
@@ -319,6 +364,7 @@ class DistributedResultReplicator:
         """
         Retorna telemetria consolidada sobre replicação de dados, cache distribuído
         e consistência dos pesos do modelo IA entre workers.
+        Expurga ou desconsidera hashes expirados no índice REPLICA_INDEX_KEY.
         """
         local_hash = get_model_sha256()
         cluster_model_hash = local_hash
@@ -334,7 +380,18 @@ class DistributedResultReplicator:
                     cluster_model_hash = remote_hash
                 members = await client.smembers(REPLICA_INDEX_KEY)
                 if members:
-                    replicated_keys = sorted(list(set(replicated_keys) | set(members)))
+                    valid_members: List[str] = []
+                    for member in members:
+                        exists = await client.exists(f"{REPLICA_KEY_PREFIX}:{member}")
+                        if exists:
+                            valid_members.append(member)
+                        else:
+                            await client.srem(REPLICA_INDEX_KEY, member)
+                            _LOCAL_REPLICA_STORE.pop(member, None)
+                    replicated_keys = [
+                        k for k in _LOCAL_REPLICA_STORE.keys() if ":yolo=" not in k
+                    ]
+                    replicated_keys = sorted(list(set(replicated_keys) | set(valid_members)))
             except Exception:
                 pass
 
