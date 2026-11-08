@@ -211,7 +211,7 @@ function renderViewport() {
 
       var style = "left:" + leftPct.toFixed(3) + "%;top:" + topPct.toFixed(3) + "%;width:" + widthPct.toFixed(3) + "%;height:" + heightPct.toFixed(3) + "%";
       var tag = d ? '<span class="cell-tag">C[' + pad2(rowIdx + 1) + ',' + pad2(colIdx + 1) + ']</span>' : "";
-      var ti = d ? ("C[" + pad2(rowIdx + 1) + "," + pad2(colIdx + 1) + "] · #" + pad2(idx) + " · " + (DEFECT_LABEL[d.defect_type] || d.defect_type) + " · " + pct((+d.confidence || 0) * 100)) : "";
+      var ti = d ? ("C[" + pad2(rowIdx + 1) + "," + pad2(colIdx + 1) + "] · #" + pad2(idx) + " · " + (DEFECT_LABEL[d.defect_type] || d.defect_type) + " · " + confPct(d.confidence, 1)) : "";
       html += '<div class="' + cls + '" data-r="' + rowIdx + '" data-c="' + colIdx + '" data-i="' + idx + '" style="' + style + '" title="' + esc(ti) + '">' + tag + '</div>';
     }
   }
@@ -484,9 +484,13 @@ function renderInspector() {
   var insDom = $("#insDominant");
   if (insDom) insDom.textContent = dom ? (DEFECT_LABEL[dom] || dom) : (m ? "NENHUM" : "—");
 
-  var confs = dl.map(function(c) { return +c.confidence || 0; });
+  var confPool = dl.length ? dl : (m && Array.isArray(m.cells) ? m.cells : []);
+  var confs = confPool.map(function(c) {
+    var v = +c.confidence || 0;
+    return (v > 0 && v <= 1.0) ? (v * 100.0) : v;
+  });
   var insConf = $("#insConf");
-  if (insConf) insConf.textContent = confs.length ? pct(confs.reduce(function(a, b) { return a + b; }, 0) / confs.length) : "—";
+  if (insConf) insConf.textContent = confs.length ? pct(confs.reduce(function(a, b) { return a + b; }, 0) / confs.length, 1) : "—";
 
   var insNode = $("#insNode");
   if (insNode) {
@@ -531,7 +535,7 @@ function renderInspector() {
         return '<tr tabindex="0" data-i="' + esc(c.index) + '" data-r="' + r + '" data-c="' + cc + '">' +
           '<td>#' + pad2(+c.index || 0) + '</td><td>' + pad2(r + 1) + '</td><td>' + pad2(cc + 1) + '</td>' +
           '<td class="c-status">' + esc(DEFECT_LABEL[c.defect_type] || String(c.defect_type || "—").toUpperCase()) + '</td>' +
-          '<td class="c-conf">' + pct((+c.confidence || 0) * 100) + '</td></tr>';
+          '<td class="c-conf">' + confPct(c.confidence, 1) + '</td></tr>';
       }).join("");
     }
   }

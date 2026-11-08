@@ -184,7 +184,7 @@ function initEvents() {
       var idx = +c.dataset.i, d = state.cellsByIndex[idx];
       var r = +c.dataset.r, cc = +c.dataset.c;
       if (d) {
-        showTip("C[" + pad2(r + 1) + "," + pad2(cc + 1) + "]  #" + pad2(idx) + "\n" + (DEFECT_LABEL[d.defect_type] || d.defect_type) + "  ·  confiança " + pct((+d.confidence || 0) * 100), e.clientX, e.clientY);
+        showTip("C[" + pad2(r + 1) + "," + pad2(cc + 1) + "]  #" + pad2(idx) + "\n" + (DEFECT_LABEL[d.defect_type] || d.defect_type) + "  ·  confiança " + confPct(d.confidence, 1), e.clientX, e.clientY);
       } else {
         showTip("C[" + pad2(r + 1) + "," + pad2(cc + 1) + "]  #" + pad2(idx) + "\ncélula nominal", e.clientX, e.clientY);
       }

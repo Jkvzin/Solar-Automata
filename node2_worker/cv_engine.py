@@ -274,7 +274,7 @@ def _fit_quad_from_hull_lines(hull: np.ndarray, img_shape: Tuple[int, int]) -> O
                 ang_diff = 360.0 - ang_diff
             dist_p0 = abs(float(np.dot(sp0 - bp0, base_norm)))
             dist_p1 = abs(float(np.dot(sp1 - bp0, base_norm)))
-            if (ang_diff <= 6.0 or abs(ang_diff - 180.0) <= 6.0) and max(dist_p0, dist_p1) <= 6.0:
+            if (ang_diff <= 8.0 or abs(ang_diff - 180.0) <= 8.0) and max(dist_p0, dist_p1) <= 8.5:
                 n_samples = max(2, int(s_len // 5))
                 for t in np.linspace(0.0, 1.0, n_samples):
                     sampled_pts.append(sp0 * (1.0 - t) + sp1 * t)
@@ -293,7 +293,7 @@ def _fit_quad_from_hull_lines(hull: np.ndarray, img_shape: Tuple[int, int]) -> O
                 float(base_dir[0]),
                 float(base_dir[1]),
                 float(bp0[0]),
-                float(bp0[1]),
+                bp0[1],
             )
 
     tl = _intersect_lines(fitted_lines["top"], fitted_lines["left"])
@@ -306,7 +306,7 @@ def _fit_quad_from_hull_lines(hull: np.ndarray, img_shape: Tuple[int, int]) -> O
 
     quad = np.array([tl, tr, br, bl], dtype=np.float32)
     # Sanity check: intersections must lie within reasonable image margin
-    margin_lim = 0.25 * max(w, h)
+    margin_lim = 0.30 * max(w, h)
     if (
         np.any(quad[:, 0] < -margin_lim)
         or np.any(quad[:, 0] > w + margin_lim)
@@ -440,6 +440,26 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
             if cv2.contourArea(largest_clahe) > 0.12 * img_area:
                 candidate_hulls.append(cv2.convexHull(largest_clahe))
 
+    # Stage C: Multi-Otsu active luminescent matrix isolation for external camera captures
+    # Separates illuminated photovoltaic cells from dark/gray test-bench surroundings
+    otsu_val, otsu_raw = cv2.threshold(blurred_raw, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    fg_pixels = blurred_raw[blurred_raw > max(12.0, float(otsu_val) * 0.55)]
+    if fg_pixels.size > 100:
+        multi_otsu_val, _ = cv2.threshold(fg_pixels, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        eff_thresh = int(max(otsu_val, min(multi_otsu_val * 0.85, np.percentile(blurred_raw, 72))))
+    else:
+        eff_thresh = int(otsu_val)
+
+    _, active_otsu = cv2.threshold(blurred_raw, eff_thresh, 255, cv2.THRESH_BINARY)
+    active_otsu = cv2.morphologyEx(active_otsu, cv2.MORPH_OPEN, kernel_open)
+    active_otsu = cv2.morphologyEx(active_otsu, cv2.MORPH_CLOSE, kernel_close)
+    cnts_otsu, _ = cv2.findContours(active_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts_otsu:
+        valid_otsu = [c for c in cnts_otsu if cv2.contourArea(c) > 0.08 * img_area]
+        if valid_otsu:
+            largest_otsu = max(valid_otsu, key=cv2.contourArea)
+            candidate_hulls.append(cv2.convexHull(largest_otsu))
+
     if not candidate_hulls:
         return None
 
@@ -461,20 +481,40 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
     return best_quad
 
 
+def _normalize_low_gain_capture(gray_img: np.ndarray) -> np.ndarray:
+    """
+    Applies 1% to 99% percentile Min-Max contrast/gain stretching on underexposed
+    external EL camera captures so that low global illumination is not mistaken
+    for an inactive/dead silicon wafer.
+    """
+    p1 = float(np.percentile(gray_img, 1))
+    p99 = float(np.percentile(gray_img, 99))
+    p85 = float(np.percentile(gray_img, 85))
+
+    # Only stretch if the capture has valid dynamic range but is globally dim (underexposed)
+    if p99 < 145.0 and (p99 - p1) >= 18.0 and (p85 - p1) >= 8.0:
+        clipped = np.clip(gray_img.astype(np.float32), p1, p99)
+        stretched = 12.0 + ((clipped - p1) / max(p99 - p1, 1.0)) * 203.0
+        return np.clip(stretched, 0, 255).astype(np.uint8)
+
+    return gray_img
+
+
 def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
     """
     Detects the outer boundary of the photovoltaic module using CLAHE contrast
-    normalization, Canny edge / Convex Hull 4-line intersection, and performs
-    homography rectification via perspective transform if the module is rotated
-    or trapezoidally distorted.
-    If the module already occupies the frame upright and orthogonal, preserves
-    the original raster.
+    normalization, Otsu/multi-Otsu active matrix isolation, Canny edge / Convex Hull
+    4-line intersection, and performs homography rectification via perspective transform
+    if the module is rotated or trapezoidally distorted.
+    Also applies 1%-99% Min-Max gain normalization on dark external captures.
     """
     if gray_img is None or gray_img.size == 0:
         raise ValueError("Input image to normalize_perspective is empty.")
 
     if len(gray_img.shape) == 3:
         gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
+
+    gray_img = _normalize_low_gain_capture(gray_img)
 
     h, w = gray_img.shape[:2]
     # Isolated single-cell crops (e.g., 300x300 ELPV cells) are already ortho-cropped
@@ -1322,6 +1362,22 @@ def draw_defect_annotations(
     overlay = annotated.copy()
 
     defective_cells = [c for c in cells if c.is_defective and c.bbox]
+    healthy_cells = [c for c in cells if not c.is_defective and c.bbox]
+
+    # Contorno sutil semitransparente (#3a4454 / BGR 84, 68, 58) nas células sadias (PASS) em painéis multi-células
+    if len(cells) > 1 and healthy_cells:
+        grid_layer = annotated.copy()
+        for cell in healthy_cells:
+            bbox = cell.bbox
+            cv2.rectangle(
+                grid_layer,
+                (bbox.x, bbox.y),
+                (bbox.x + bbox.width, bbox.y + bbox.height),
+                (84, 68, 58),
+                1
+            )
+        cv2.addWeighted(grid_layer, 0.45, annotated, 0.55, 0, annotated)
+        overlay = annotated.copy()
 
     # Preenchimento translúcido das células com defeito
     for cell in defective_cells:
@@ -1478,6 +1534,12 @@ def evaluate_module(
                 [item["image"] for item in segmented_cells],
                 model=yolo_model
             )
+            inner_stds = [
+                float(np.std(_trim_cell_gap_margins(it["image"], trim_ratio=0.10)))
+                for it in segmented_cells
+            ]
+            median_cell_std = float(np.median(inner_stds)) if inner_stds else 15.0
+
             batch_preds = []
             for item, (y_def, y_type, y_conf) in zip(segmented_cells, raw_yolo_preds):
                 cell_img = item["image"]
@@ -1490,15 +1552,20 @@ def evaluate_module(
                 if y_def:
                     # Cross-validate with radiometric & gradient consistency to suppress false alarms
                     # caused by perspective warp interpolation, half-cut aspect ratios, or borderline scores
-                    if not h_def and c_std < 10.5 and (0.85 <= rel_b <= 1.15):
+                    if not h_def and c_std < 9.5 and (0.87 <= rel_b <= 1.13):
                         batch_preds.append((False, DefectType.NONE, h_conf))
-                    elif not h_def and y_conf < 0.78 and (0.88 <= rel_b <= 1.12):
+                    elif not h_def and y_conf < 0.72 and (0.90 <= rel_b <= 1.10):
                         batch_preds.append((False, DefectType.NONE, h_conf))
                     else:
                         batch_preds.append((True, y_type, y_conf))
                 else:
-                    # Recover severe physical defects (completely dead cell or synthetic defect)
-                    if h_def and (h_type == DefectType.DEAD or (c_std < 17.5 and h_conf >= 0.65)):
+                    # Recover subtle & severe physical defects (dead cells, grid-faults, delamination, micro-cracks)
+                    if h_def and (
+                        h_type in (DefectType.DEAD, DefectType.GRID_FAULT, DefectType.DELAMINATION)
+                        or rel_b < 0.84
+                        or (median_cell_std < 13.5 and h_conf >= 0.65)
+                        or (c_std < 17.5 and h_conf >= 0.65)
+                    ):
                         batch_preds.append((True, DefectType.DEFEITUOSA, h_conf))
                     else:
                         batch_preds.append((False, DefectType.NONE, y_conf))

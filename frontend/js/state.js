@@ -56,6 +56,13 @@ function pct(n, d) {
   return nf(n, d) + "%";
 }
 
+function confPct(val, d) {
+  if (val === null || val === undefined || !isFinite(val)) return "—";
+  var num = +val;
+  var scaled = (num > 0 && num <= 1.0) ? (num * 100.0) : num;
+  return pct(scaled, d === undefined ? 1 : d);
+}
+
 function int(n) {
   if (n === null || n === undefined || !isFinite(n)) return "—";
   return new Intl.NumberFormat("pt-BR").format(n);
