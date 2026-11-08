@@ -104,6 +104,8 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node1_gateway/main.py:/app/main.py
+      - ./node1_gateway/auth.py:/app/auth.py
+      - ./node1_gateway/history.py:/app/history.py
       - ./luminapv-el-console.html:/app/luminapv-el-console.html
       - ./frontend:/app/frontend
       - ./fixtures:/app/fixtures

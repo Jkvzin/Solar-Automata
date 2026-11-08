@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy gateway source code and static assets
 COPY node1_gateway/main.py .
+COPY node1_gateway/auth.py .
+COPY node1_gateway/history.py .
 COPY luminapv-el-console.html ./luminapv-el-console.html
 COPY frontend/ ./frontend/
 COPY fixtures/ ./fixtures/
