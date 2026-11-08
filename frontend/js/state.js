@@ -120,7 +120,7 @@ function renderLog() {
     return;
   }
   out.innerHTML = state.log.slice().reverse().map(function(e) {
-    var lv = e.level === "error" ? "err" : (e.level === "ok" ? "ok" : (e.level === "req" ? "req" : ""));
+    var lv = e.level === "error" ? "err" : (e.level === "ok" ? "ok" : (e.level === "req" ? "req" : (e.level === "warn" ? "warn" : (e.level === "info" ? "info" : ""))));
     return '<div><time class="mono">' + e.t + '</time><span class="lvl ' + lv + '">' + esc(e.level.toUpperCase()) + '</span><span class="msg">' + esc(e.msg) + '</span></div>';
   }).join("");
 }
