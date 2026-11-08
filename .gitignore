@@ -51,6 +51,8 @@ coverage.xml
 *.swp
 *.swo
 *~
+*.save
+*.save.*
 .file-versions/
 .od-skills/
 *.artifact.json
@@ -63,3 +65,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Internal context & documentation (not tracked on GitHub)
+contexto*
+[Cc]ontexto*
+resultado_painel*.png
+

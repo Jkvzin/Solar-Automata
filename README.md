@@ -7,7 +7,7 @@
 [![SciPy](https://img.shields.io/badge/SciPy-1.11+-8CAAE6.svg?logo=scipy)](https://scipy.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker)](https://www.docker.com/)
 [![Google Cloud Run](https://img.shields.io/badge/GCP-Cloud_Run-4285F4.svg?logo=googlecloud)](https://cloud.google.com/run)
-[![Tests Passing](https://img.shields.io/badge/tests-14%2F14%20passing-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen.svg)]()
 [![Status](https://img.shields.io/badge/status-production--ready-success.svg)]()
 
 **Solar-Automata** is a high-performance, distributed computer vision platform designed for automated optical quality assurance (QA) and electroluminescence (EL) diagnostic inspection of solar photovoltaic (PV) modules. 
@@ -28,8 +28,9 @@ Combining an asynchronous API gateway, high-precision computer vision worker nod
 - [Automated Testing & Verification](#6-automated-testing--verification)
 - [Industrial Frontend Console (LuminaPV)](#7-industrial-frontend-console-luminapv)
 - [Google Cloud Run Deployment](#8-google-cloud-run-deployment)
-- [EL Hardware & Inspection Principles](#9-el-hardware--inspection-principles)
-- [License & Credits](#10-license--credits)
+- [Distributed Systems Architecture (Entrega 3)](#9-distributed-systems-architecture-entrega-3)
+- [EL Hardware & Inspection Principles](#10-el-hardware--inspection-principles)
+- [License & Credits](#11-license--credits)
 
 ---
 
@@ -48,7 +49,7 @@ Solar-Automata is engineered around a decoupled, multi-node microservices archit
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                     NODE 1: API Gateway & Orchestrator                   │
 │                                (FastAPI)                                 │
-│  - Host Port: 8080                                                       │
+│  - Host Port: 8080 (gateway.luminapv.local)                              │
 │  - Serves modular LuminaPV frontend at GET /                             │
 │  - Legacy single-file console fallback at GET /legacy                    │
 │  - Ingests bulk uploads (N full-size module images concurrently)         │
@@ -60,14 +61,14 @@ Solar-Automata is engineered around a decoupled, multi-node microservices archit
          Internal Async REST: POST /api/v1/process-module (raw binary)
                                      ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                    NODE 2: Computer Vision Worker Node                   │
-│                        (FastAPI + OpenCV + SciPy)                        │
-│  - Host Port: 8001                                                       │
+│                    NODE 2: Computer Vision Worker Nodes                  │
+│               (FastAPI + OpenCV + SciPy + YOLOv8-cls + Redis)            │
+│  - Replicas: worker-1.luminapv.local (8001), worker-2.luminapv.local     │
 │  - Ingests single module raw image stream (PNG, JPEG, TIFF, WebP)        │
 │  - Perspective Homography Normalization (rectification of tilted panels) │
 │  - Dynamic Grid Topology Inference (Sobel gradients & valley projection) │
-│  - Zero-disk in-memory cell slicing (R x C discrete NumPy sub-arrays)    │
-│  - Luminescence defect classification (strict enum & calibrated score)   │
+│  - Zero-disk in-memory cell slicing & Batch YOLOv8-cls inference         │
+│  - Primary-Backup result replication & Read-Your-Writes cache            │
 │  - Industrial Pass/Fail evaluation (FAIL if damage >= 5.0%, else PASS)   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -84,12 +85,13 @@ Solar-Automata is engineered around a decoupled, multi-node microservices archit
 - Robust quadrilateral contour estimation detects tilted, skewed, or off-axis solar panels captured by production line cameras.
 - Calculates an optimal $3\times3$ homography matrix using `cv2.getPerspectiveTransform` and rectifies the active cell matrix to an orthogonal projection before grid slicing.
 
-### ⚡ Zero-Disk In-Memory Processing Pipeline
-- Entire inspection cycle—from multipart upload decoding to homography rectification, cell segmentation, luminescence analysis, and JSON serialization—executes exclusively in memory via NumPy/OpenCV buffers.
-- Eliminates file system latency, prevents temporary file leaks, and enhances horizontal scaling on containerized environments like Google Cloud Run.
+### ⚡ Zero-Disk In-Memory Processing & Vectorized Batch YOLOv8-cls
+- Entire inspection cycle—from multipart upload decoding to homography rectification, cell segmentation, batch YOLOv8-cls inference (`best.pt`), and JSON serialization—executes exclusively in memory via NumPy/OpenCV buffers.
+- Eliminates file system latency, prevents temporary file leaks, and enhances horizontal scaling on containerized environments.
 
 ### 🛡️ Strict Defect Classification & Decision Rules
-Each sliced cell is evaluated across luminescence histogram distributions, standard deviations, and local gradient anomalies:
+Each sliced cell is evaluated via the trained **YOLOv8-cls** model (`boa` vs. `defeituosa`) with automatic fallback to luminescence heuristics:
+- **`defeituosa`**: Cell classified as defective by the YOLOv8-cls neural network (`best.pt`).
 - **`micro-crack`**: Hairline crystalline fractures causing localized luminescence loss.
 - **`dead`**: Completely inactive cell or disconnected wafer area (near-zero emission).
 - **`hot-spot`**: Localized resistance anomalies exhibiting abnormal high-intensity emission.
@@ -133,10 +135,11 @@ Solar-Automata/
 │   ├── requirements.txt               # Gateway dependencies (fastapi, httpx, uvicorn)
 │   └── Dockerfile                     # Production container spec
 │
-├── node2_worker/                      # Computer Vision Worker (FastAPI + OpenCV + SciPy)
-│   ├── main.py                        # Single module REST endpoint & health probes
-│   ├── cv_engine.py                   # Dynamic Sobel grid detection & defect classification
-│   ├── requirements.txt               # Worker dependencies (opencv, scipy, numpy, etc.)
+├── node2_worker/                      # Computer Vision Worker (FastAPI + OpenCV + YOLOv8-cls)
+│   ├── main.py                        # REST endpoints, heartbeat registry & replication manager
+│   ├── cv_engine.py                   # Dynamic Sobel grid detection & batch YOLOv8-cls engine
+│   ├── models/best.pt                 # Trained YOLOv8-cls solar cell classification weights
+│   ├── requirements.txt               # Worker dependencies (opencv, scipy, ultralytics, redis)
 │   └── Dockerfile                     # Production container spec (Debian + GL/X11 libs)
 │
 ├── fixtures/                          # Sample batch payloads for instant testing
@@ -149,10 +152,10 @@ Solar-Automata/
 │   │   ├── scan_module_12x10_fail.png
 │   │   └── scan_module_tilted_6x10.png
 │   ├── generate_test_modules.py       # Deterministic EL solar panel scan generator
-│   ├── test_cv_engine.py              # Unit tests for CV algorithms & edge cases
-│   └── test_api_integration.py        # Integration tests for distributed endpoints
+│   ├── test_cv_engine.py              # Unit tests for CV algorithms & batch YOLOv8-cls
+│   └── test_api_integration.py        # Integration tests for distributed endpoints & replicas
 │
-├── docker-compose.yml                 # Multi-container orchestration with live mounts
+├── docker-compose.yml                 # Multi-container orchestration (Registry + 2 Workers + Gateway)
 ├── DEPLOYMENT_GCP.md                  # Complete Google Cloud Run deployment manual
 ├── brand-spec.md                      # UI tokens & industrial design system specifications
 ├── luminapv-el-console.html           # Legacy monolithic workstation (maintained for parity)
@@ -172,7 +175,7 @@ Requires Docker and Docker Compose installed:
 git clone https://github.com/Jkvzin/Solar-Automata.git
 cd Solar-Automata
 
-# Build images and start services in the background
+# Build images and start services in the background (Registry + 2 Workers + Gateway)
 docker compose up --build -d
 
 # Verify container health
@@ -253,77 +256,23 @@ curl -X POST "http://localhost:8080/api/v1/analyze/bulk" \
   -F "files=@tests/fixtures/scan_module_6x12_fail.png"
 ```
 
-**Response (`200 OK`):**
-```json
-{
-  "batch_summary": {
-    "total_modules": 2,
-    "defective_modules_count": 1,
-    "batch_failure_percentage": 50.0,
-    "average_cell_degradation_percentage": 5.4
-  },
-  "modules": [
-    {
-      "module_id": "MOD-2026-001",
-      "filename": "scan_module_6x10_pass.png",
-      "status": "PASS",
-      "rows": 6,
-      "cols": 10,
-      "total_cells": 60,
-      "defective_cells_count": 1,
-      "module_damage_percentage": 1.7,
-      "image_width": 1000,
-      "image_height": 600,
-      "cells": [
-        {
-          "index": 0,
-          "row": 0,
-          "col": 0,
-          "is_defective": false,
-          "defect_type": "none",
-          "confidence": 0.99,
-          "bbox": {
-            "x": 20,
-            "y": 18,
-            "width": 94,
-            "height": 92,
-            "x_pct": 2.0,
-            "y_pct": 3.0,
-            "width_pct": 9.4,
-            "height_pct": 15.3
-          }
-        }
-      ]
-    }
-  ]
-}
-```
-
-#### Gateway Health Check
-`GET /health` or `GET /api/v1/health`  
-Returns gateway status and upstream worker connectivity:
-```json
-{
-  "status": "healthy",
-  "service": "node1_gateway",
-  "worker_service_url": "http://node2_worker:8001",
-  "worker_connectivity": "connected"
-}
-```
-
 ---
 
-### 🔬 Node 2: Vision Worker (Port 8001)
+### 🔬 Node 2: Vision Worker (Ports 8001 / 8002)
 
 #### Process Individual Module Scan
 `POST /api/v1/process-module`  
 *Consumes:* `multipart/form-data` with single file upload under key `"file"`.
 
-**Sample cURL Request:**
 ```bash
 curl -X POST "http://localhost:8001/api/v1/process-module" \
   -F "file=@tests/fixtures/scan_module_6x10_pass.png"
 ```
+
+#### Service Discovery & Replication Telemetry
+- `GET /api/v1/registry/node`: Returns active node naming and heartbeat metadata.
+- `GET /api/v1/replicas/stats`: Returns replication strategy, consistency model, cache hits/misses, and SHA-256 model consistency across the cluster.
+- `GET /api/v1/replicas/{content_sha256}`: Fetches a replicated `ModuleResult` by image content SHA-256 hash.
 
 ---
 
@@ -331,29 +280,20 @@ curl -X POST "http://localhost:8001/api/v1/process-module" \
 
 The repository includes a comprehensive, multi-layer automated test suite with deterministic module generators, computer vision unit tests, and end-to-end integration tests.
 
-### 1. Generate Synthetic Photovoltaic Test Scans
-Produces standardized test scans in `tests/fixtures/` ($6\times10$ PASS, $6\times12$ FAIL, $12\times10$ FAIL, and perspective-tilted $6\times10$):
-```bash
-python tests/generate_test_modules.py
-```
-
-### 2. Run Computer Vision Unit Tests
-Validates dynamic grid peak detection, perspective homography rectification, in-memory cell slicing, defect classification enums, and corrupted file handling:
+### 1. Run Computer Vision Unit Tests
 ```bash
 python -m unittest tests/test_cv_engine.py
 ```
 
-### 3. Run Distributed Integration Tests
-Tests parallel dispatch, multipart decoding, batch telemetry calculation, 422 validation, and worker routing:
+### 2. Run Distributed Integration Tests
 ```bash
 python -m unittest tests/test_api_integration.py
 ```
 
-### 4. Run the Full Test Suite
+### 3. Run the Full Test Suite
 ```bash
-python -m unittest discover tests
+python -m unittest discover -s tests -v
 ```
-*Expected Result:* `Ran 14 tests in ~0.35s - OK`
 
 ---
 
@@ -374,17 +314,43 @@ The frontend is built according to the **VS Code Dark Technical** industrial des
 
 ## 8. Google Cloud Run Deployment
 
-Solar-Automata is fully containerized and production-ready for deployment on **Google Cloud Run**:
-1. **Node 2 Worker** is deployed as an internal/private or authenticated Cloud Run service.
-2. The deployed worker HTTPS URL is injected into **Node 1 Gateway** as the `WORKER_SERVICE_URL` environment variable.
-3. Node 1 serves the frontend and proxies bulk inspection traffic with automatic connection pooling and async dispatch.
-
-Detailed step-by-step CLI commands, IAM permission configurations, and cost-optimization recommendations are available in:
+Solar-Automata is fully containerized and production-ready for deployment on **Google Cloud Run**. Detailed step-by-step CLI commands, IAM permission configurations, and cost-optimization recommendations are available in:
 📄 **[DEPLOYMENT_GCP.md](DEPLOYMENT_GCP.md)**
 
 ---
 
-## 9. EL Hardware & Inspection Principles
+## 9. Distributed Systems Architecture (Entrega 3)
+
+### 9.1. Esquema de Nomeação e Descoberta de Serviços (Naming & Service Discovery)
+O cluster utiliza um esquema híbrido composto por **DNS estruturado na rede interna Docker** (`*.luminapv.local`) e **Catálogo Dinâmico com Auto-Registro via Heartbeat**:
+- **Domínio Interno Padronizado**:
+  - `gateway.luminapv.local` (`node1_gateway` — Porta `8080`)
+  - `state.luminapv.local` / `redis.luminapv.local` (`luminapv-registry` — Porta `6379`)
+  - `worker-1.luminapv.local` (`node2-worker-1` — Porta `8001`)
+  - `worker-2.luminapv.local` (`node2-worker-2` — Porta `8002` externa / `8001` interna)
+- **Identificador Lógico de Serviço**: `service://luminapv-vision-worker`.
+- **Protocolo de Heartbeat**: Cada réplica de `node2_worker` executa um ciclo assíncrono em background (`HEARTBEAT_INTERVAL_SECONDS = 3.0s`) gravando seus metadados (`node_id`, `dns_name`, `endpoint`, `model_sha256`, `last_seen`) na chave `luminapv:services:vision-worker:<node_id>` com expiração automática (`TTL = 10s`), permitindo detecção rápida de falhas e remoção imediata de nós inativos.
+
+### 9.2. Mecanismos de Coordenação (Eleição de Líder e Exclusão Mútua)
+- **Eleição de Líder entre Workers (`node2_worker`)**: Os nós ativos disputam um *lease* atômico distribuído no Redis (`SET luminapv:leader <payload> NX EX 8`) com renovação periódica. O nó eleito assume papel `LEADER`, incrementa o termo e atualiza o lease; as demais réplicas operam como `FOLLOWER`. Se o líder cair (`docker stop`), o lease expira em 8 segundos e os seguidores detectam a vacância, elegendo um novo líder em até 5–10 segundos. O estado é exposto em `GET /health` (`role`, `term`, `leader_id`) e pode ser testado via `POST /api/v1/cluster/election`.
+- **Exclusão Mútua Distribuída (`DistributedLock` no `node1_gateway`)**: O processamento concorrente de módulos no `POST /api/v1/analyze/bulk` adquire locks atômicos no Redis baseados no hash SHA-256 do arquivo (`lock:module:<sha256>`) com TTL contra *deadlocks* e liberação atômica em bloco `finally` via script Lua (`_LUA_RELEASE_LOCK`). Locks ativos são rastreados em `luminapv:active_locks`.
+- **Resiliência na Ingestão AWS**: As chamadas AWS S3/SQS em `analyze_bulk` são configuráveis via variável de ambiente (`AWS_INGESTION_ENABLED`) e protegidas por `try/except`, garantindo continuidade operacional sem erro HTTP 500 em execuções locais ou Docker sem credenciais na nuvem.
+
+### 9.3. Replicação de Dados/Modelos e Especificação Formal do Modelo de Consistência
+- **Estratégia de Replicação (*Primary-Backup* + Cache Distribuído de Inferência)**:
+  - Todo resultado de inspeção (`ModuleResult`) processado por um worker é indexado pelo hash SHA-256 do conteúdo da imagem (`luminapv:replica:module:<content_sha256>`) e replicado simultaneamente no store primário compartilhado (`state.luminapv.local`) e nos stores em memória locais das réplicas (`_LOCAL_REPLICA_STORE`).
+  - **Consistência de Pesos de IA (`model_sha256`)**: Cada registro replicado armazena o hash SHA-256 do arquivo de pesos `best.pt` (YOLOv8-cls). Ao consultar uma réplica em cache, o worker valida se `cached.model_sha256 == local.model_sha256`, invalidando automaticamente caches antigos caso o modelo seja atualizado.
+- **Definição Formal do Modelo de Consistência**:
+  1. **Consistência *Read-Your-Writes* (Leitura das Próprias Escritas — Centrada no Cliente)**:
+     - Toda operação `POST /api/v1/process-module` ou `POST /api/v1/analyze/bulk` confirma a gravação síncrona no store primário antes de responder ao cliente. Assim, qualquer leitura subsequente realizada pelo mesmo operador ou pelo console web (`GET /api/v1/replicas/{sha256}` ou reenvio de lote) enxerga garantidamente a versão mais recente escrita.
+  2. **Consistência Eventual (*Eventual Consistency* — Centrada em Dados entre Réplicas)**:
+     - Os caches internos em memória (`_LOCAL_REPLICA_STORE`) das demais réplicas de `node2_worker` convergem assincronamente à medida que novas leituras ou ciclos de sincronização ocorrem.
+  3. **Justificativa pelo Teorema CAP / PACELC**:
+     - Em inspeção óptica industrial em linha de produção, o sistema prioriza **Disponibilidade e Baixa Latência (PA/EL)**: caso ocorra partição ou queda de um worker (`node2-worker-1`), o cluster continua operando através das réplicas sobreviventes (`node2-worker-2`) e do fallback local, garantindo continuidade operacional sem perda dos diagnósticos já replicados.
+
+---
+
+## 10. EL Hardware & Inspection Principles
 
 ### Physics of Electroluminescence in Photovoltaics
 Electroluminescence inspection functions as the reverse of the photovoltaic effect:
@@ -396,7 +362,7 @@ Electroluminescence inspection functions as the reverse of the photovoltaic effe
 
 ---
 
-## 10. License & Credits
+## 11. License & Credits
 
 - **Repository**: [Jkvzin/Solar-Automata](https://github.com/Jkvzin/Solar-Automata)
 - **Engine**: LuminaPV Distributed Optical Diagnostic Engine

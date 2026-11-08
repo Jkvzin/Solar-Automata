@@ -1,20 +1,85 @@
 services:
-  node2-worker:
+  luminapv-registry:
+    image: redis:7-alpine
+    container_name: luminapv-registry
+    hostname: state.luminapv.local
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      luminapv-network:
+        aliases:
+          - state.luminapv.local
+          - redis.luminapv.local
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  node2-worker-1:
     build:
       context: ./node2_worker
       dockerfile: Dockerfile
-    container_name: luminapv-node2-worker
+    container_name: luminapv-node2-worker-1
+    hostname: worker-1.luminapv.local
     restart: unless-stopped
     ports:
       - "8001:8001"
     environment:
       - PORT=8001
+      - NODE_ID=worker-1
+      - SERVICE_NAME=service://luminapv-vision-worker
+      - WORKER_DNS_NAME=worker-1.luminapv.local
+      - REDIS_URL=redis://state.luminapv.local:6379/0
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node2_worker/main.py:/app/main.py
       - ./node2_worker/cv_engine.py:/app/cv_engine.py
+      - ./node2_worker/models:/app/models
+    depends_on:
+      luminapv-registry:
+        condition: service_healthy
     networks:
-      - luminapv-network
+      luminapv-network:
+        aliases:
+          - worker-1.luminapv.local
+          - node2-worker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  node2-worker-2:
+    build:
+      context: ./node2_worker
+      dockerfile: Dockerfile
+    container_name: luminapv-node2-worker-2
+    hostname: worker-2.luminapv.local
+    restart: unless-stopped
+    ports:
+      - "8002:8001"
+    environment:
+      - PORT=8001
+      - NODE_ID=worker-2
+      - SERVICE_NAME=service://luminapv-vision-worker
+      - WORKER_DNS_NAME=worker-2.luminapv.local
+      - REDIS_URL=redis://state.luminapv.local:6379/0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./node2_worker/main.py:/app/main.py
+      - ./node2_worker/cv_engine.py:/app/cv_engine.py
+      - ./node2_worker/models:/app/models
+    depends_on:
+      luminapv-registry:
+        condition: service_healthy
+    networks:
+      luminapv-network:
+        aliases:
+          - worker-2.luminapv.local
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
@@ -27,12 +92,15 @@ services:
       context: .
       dockerfile: ./node1_gateway/Dockerfile
     container_name: luminapv-node1-gateway
+    hostname: gateway.luminapv.local
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
       - PORT=8080
-      - WORKER_SERVICE_URL=http://node2-worker:8001
+      - WORKER_SERVICE_URL=http://worker-1.luminapv.local:8001
+      - WORKER_SERVICE_NAME=service://luminapv-vision-worker
+      - REDIS_URL=redis://state.luminapv.local:6379/0
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node1_gateway/main.py:/app/main.py
@@ -40,10 +108,16 @@ services:
       - ./frontend:/app/frontend
       - ./fixtures:/app/fixtures
     depends_on:
-      node2-worker:
+      luminapv-registry:
+        condition: service_healthy
+      node2-worker-1:
+        condition: service_healthy
+      node2-worker-2:
         condition: service_healthy
     networks:
-      - luminapv-network
+      luminapv-network:
+        aliases:
+          - gateway.luminapv.local
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s

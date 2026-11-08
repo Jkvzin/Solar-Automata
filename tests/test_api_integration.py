@@ -2,7 +2,9 @@
 Integration Tests for Node 1 (Gateway) and Node 2 (Worker)
 ==========================================================
 Verifies:
-- Node 2 standalone endpoints (/health, /api/v1/process-module, error responses)
+- Node 2 standalone endpoints (/health, /api/v1/registry/node, /api/v1/replicas/stats, /api/v1/process-module)
+- Node 2 service discovery heartbeat registration (Redis + memory fallback)
+- Node 2 Primary-Backup result replication, Read-Your-Writes distributed cache hit, and model consistency
 - Node 1 static and console serving (/ and /fixtures/...)
 - Node 1 bulk orchestrator (/api/v1/analyze/bulk) with concurrent dispatch
 - Telemetry aggregation calculations and JSON contract conformity
@@ -27,6 +29,7 @@ sys.path.insert(0, str(ROOT_DIR / "node2_worker"))
 
 import node1_gateway.main as gateway_module
 from node1_gateway.main import app as gateway_app
+import node2_worker.main as worker_module
 from node2_worker.main import app as worker_app
 
 
@@ -34,27 +37,64 @@ class TestDistributedAPIIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixtures_dir = ROOT_DIR / "tests" / "fixtures"
+        # Mock AWS S3 & SQS clients to prevent network calls/timeouts in test environments
+        patcher_s3 = patch.object(gateway_module, "s3_client")
+        patcher_sqs = patch.object(gateway_module, "sqs_client")
+        cls.mock_s3 = patcher_s3.start()
+        cls.mock_sqs = patcher_sqs.start()
+        cls.addClassCleanup(patcher_s3.stop)
+        cls.addClassCleanup(patcher_sqs.stop)
+
         cls.worker_client = TestClient(worker_app)
         cls.gateway_client = TestClient(gateway_app)
 
     # -------------------------------------------------------------------------
-    # Node 2 (Worker) Tests
+    # Node 2 (Worker), Service Discovery & Replication Tests
     # -------------------------------------------------------------------------
     def test_worker_health(self):
-        """Worker /health probe returns 200 and healthy status."""
+        """Worker /health probe returns 200, healthy status, naming, and consistency metadata."""
         response = self.worker_client.get("/health")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "healthy")
         self.assertEqual(data["service"], "node2_worker")
+        self.assertIn("node_id", data)
+        self.assertIn("service_name", data)
+        self.assertIn("dns_name", data)
+        self.assertIn("model_sha256", data)
+        self.assertEqual(len(data["model_sha256"]), 64)
+        self.assertEqual(data["consistency_model"], "read-your-writes")
+        self.assertTrue(data["model_consistent"])
+
+    def test_worker_registry_node_endpoint_and_redis_heartbeat(self):
+        """Worker /api/v1/registry/node exposes naming metadata and supports Redis heartbeat."""
+        response = self.worker_client.get("/api/v1/registry/node")
+        self.assertEqual(response.status_code, 200)
+        meta = response.json()
+        self.assertEqual(meta["service_name"], "service://luminapv-vision-worker")
+        self.assertTrue(meta["dns_name"].endswith(".luminapv.local"))
+        self.assertEqual(meta["status"], "ONLINE")
+
+        # Verify Redis heartbeat registration with mocked Redis client
+        mock_redis = AsyncMock()
+        worker_module.registry.redis_client = mock_redis
+        try:
+            hb_meta = asyncio.run(worker_module.registry.register_heartbeat())
+            self.assertEqual(hb_meta["registry_backend"], "redis")
+            mock_redis.set.assert_awaited_once()
+            mock_redis.sadd.assert_awaited_once()
+        finally:
+            worker_module.registry.redis_client = None
 
     def test_worker_process_module_valid(self):
-        """Worker processes valid module scan and returns contract conforming JSON."""
+        """Worker processes valid module scan and returns contract conforming JSON with replication metadata."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
         img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
         with open(img_path, "rb") as f:
-            files = {"file": ("scan_module_6x10_pass.png", f.read(), "image/png")}
+            raw_bytes = f.read()
 
-        response = self.worker_client.post("/api/v1/process-module", files=files)
+        files = {"file": ("scan_module_6x10_pass.png", raw_bytes, "image/png")}
+        response = self.worker_client.post("/api/v1/process-module?use_yolo=false&use_cache=false", files=files)
         self.assertEqual(response.status_code, 200)
         data = response.json()
 
@@ -64,7 +104,58 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(data["cols"], 10)
         self.assertEqual(data["total_cells"], 60)
         self.assertEqual(data["status"], "PASS")
+        self.assertIn("processed_by_node", data)
+        self.assertIn("model_sha256", data)
+        self.assertIn("content_sha256", data)
+        self.assertTrue(data["replicated"])
+        self.assertFalse(data["cache_hit"])
+        self.assertEqual(data["consistency_model"], "read-your-writes")
         self.assertEqual(len(data["cells"]), 60)
+
+    def test_worker_distributed_replication_and_read_your_writes_cache(self):
+        """Worker replicates ModuleResult and serves Read-Your-Writes cache hit on subsequent requests."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            raw_bytes = f.read()
+
+        # 1st request: cache miss -> evaluates and replicates
+        res1 = self.worker_client.post(
+            "/api/v1/process-module?use_yolo=false&use_cache=true",
+            files={"file": ("scan_01.png", raw_bytes, "image/png")}
+        )
+        self.assertEqual(res1.status_code, 200)
+        d1 = res1.json()
+        self.assertTrue(d1["replicated"])
+        self.assertFalse(d1["cache_hit"])
+        content_hash = d1["content_sha256"]
+
+        # 2nd request with same image content: Read-Your-Writes cache HIT
+        res2 = self.worker_client.post(
+            "/api/v1/process-module?use_yolo=false&use_cache=true",
+            files={"file": ("scan_02.png", raw_bytes, "image/png")}
+        )
+        self.assertEqual(res2.status_code, 200)
+        d2 = res2.json()
+        self.assertTrue(d2["replicated"])
+        self.assertTrue(d2["cache_hit"])
+        self.assertEqual(d2["content_sha256"], content_hash)
+        self.assertEqual(d2["filename"], "scan_02.png")
+
+        # Verify GET /api/v1/replicas/{content_sha256}
+        replica_resp = self.worker_client.get(f"/api/v1/replicas/{content_hash}")
+        self.assertEqual(replica_resp.status_code, 200)
+        self.assertEqual(replica_resp.json()["content_sha256"], content_hash)
+
+        # Verify GET /api/v1/replicas/stats
+        stats_resp = self.worker_client.get("/api/v1/replicas/stats")
+        self.assertEqual(stats_resp.status_code, 200)
+        stats = stats_resp.json()
+        self.assertEqual(stats["consistency_model"], "read-your-writes")
+        self.assertEqual(stats["replication_strategy"], "primary-backup")
+        self.assertTrue(stats["model_consistent"])
+        self.assertGreaterEqual(stats["total_replicated_modules"], 1)
+        self.assertGreaterEqual(stats["cache_hits"], 1)
 
     def test_worker_corrupted_image_returns_422(self):
         """Worker returns HTTP 422 with structured detail when image is corrupt."""
@@ -137,6 +228,9 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "total_cells": 60,
             "defective_cells_count": 1,
             "module_damage_percentage": 1.7,
+            "processed_by_node": "worker-1",
+            "replicated": True,
+            "consistency_model": "read-your-writes",
             "cells": []
         }
         mock_module_fail = {
@@ -148,6 +242,9 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "total_cells": 72,
             "defective_cells_count": 12,
             "module_damage_percentage": 16.7,
+            "processed_by_node": "worker-2",
+            "replicated": True,
+            "consistency_model": "read-your-writes",
             "cells": []
         }
 
@@ -193,9 +290,9 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             f2_bytes = f2.read()
 
         async def direct_worker_dispatch(client, file_bytes, filename, content_type):
-            # Call worker app directly in-memory
+            # Call worker app directly in-memory with deterministic heuristic for synthetic fixtures
             from cv_engine import evaluate_module
-            res = evaluate_module(file_bytes, filename=filename)
+            res = evaluate_module(file_bytes, filename=filename, use_yolo=False)
             return json.loads(res.model_dump_json())
 
         with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=direct_worker_dispatch):
@@ -217,6 +314,148 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             self.assertEqual(len(modules), 2)
             self.assertEqual(modules[0]["status"], "PASS")
             self.assertEqual(modules[1]["status"], "FAIL")
+
+    # -------------------------------------------------------------------------
+    # Issue #3: Leader Election & Coordination Tests
+    # -------------------------------------------------------------------------
+    def test_worker_health_leader_election_telemetry(self):
+        """Worker /health probe exposes leader election metadata: role, term, and leader_id."""
+        response = self.worker_client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("role", data)
+        self.assertIn("term", data)
+        self.assertIn("leader_id", data)
+        self.assertIn(data["role"], ["LEADER", "FOLLOWER"])
+        self.assertIsInstance(data["term"], int)
+        self.assertGreaterEqual(data["term"], 1)
+
+    def test_worker_cluster_election_step_down_and_reelect(self):
+        """Worker POST /api/v1/cluster/election supports step_down simulation and re-election."""
+        # 1. Step down
+        resp_step = self.worker_client.post("/api/v1/cluster/election?action=step_down")
+        self.assertEqual(resp_step.status_code, 200)
+        step_data = resp_step.json()
+        self.assertEqual(step_data["status"], "election_triggered")
+        self.assertEqual(step_data["role"], "FOLLOWER")
+
+        # 2. Re-elect
+        resp_elect = self.worker_client.post("/api/v1/cluster/election?action=reelect")
+        self.assertEqual(resp_elect.status_code, 200)
+        elect_data = resp_elect.json()
+        self.assertEqual(elect_data["status"], "election_evaluated")
+        self.assertIn(elect_data["role"], ["LEADER", "FOLLOWER"])
+
+    def test_worker_leader_election_with_mocked_redis(self):
+        """Worker LeaderElectionManager acquires atomic lease (SET ... NX EX 8) and updates term in Redis."""
+        mock_redis = AsyncMock()
+        mock_redis.get.return_value = None  # No current leader
+        mock_redis.incr.return_value = 2    # Term incremented
+        mock_redis.set.return_value = True  # Lease acquired
+
+        worker_module.registry.redis_client = mock_redis
+        try:
+            res = asyncio.run(worker_module.election_manager.elect_or_renew())
+            self.assertEqual(res["role"], "LEADER")
+            self.assertEqual(res["term"], 2)
+            self.assertEqual(res["leader_id"], worker_module.registry.node_id)
+            mock_redis.set.assert_awaited()
+        finally:
+            worker_module.registry.redis_client = None
+
+    # -------------------------------------------------------------------------
+    # Issue #3: Distributed Mutual Exclusion (DistributedLock) Tests
+    # -------------------------------------------------------------------------
+    def test_distributed_lock_acquisition_release_and_collision(self):
+        """DistributedLock acquires lock, tracks active locks, and blocks conflicting concurrent acquires."""
+        lock1 = gateway_module.lock_manager.create_lock("lock:module:test_hash_abc", ttl_seconds=10)
+        lock2 = gateway_module.lock_manager.create_lock("lock:module:test_hash_abc", ttl_seconds=10)
+
+        # 1. First acquire succeeds
+        acquired1 = asyncio.run(lock1.acquire())
+        self.assertTrue(acquired1)
+
+        # 2. Verify active locks tracking
+        active = asyncio.run(gateway_module.lock_manager.get_active_locks())
+        self.assertTrue(any(item["resource"] == "lock:module:test_hash_abc" for item in active))
+
+        # 3. Second acquire for the same resource fails while held
+        acquired2 = asyncio.run(lock2.acquire(timeout=0.1))
+        self.assertFalse(acquired2)
+
+        # 4. Release lock 1
+        released1 = asyncio.run(lock1.release())
+        self.assertTrue(released1)
+
+        # 5. Lock 2 can now acquire
+        acquired2_after = asyncio.run(lock2.acquire(timeout=0.5))
+        self.assertTrue(acquired2_after)
+        asyncio.run(lock2.release())
+
+    def test_distributed_lock_redis_lua_integration(self):
+        """DistributedLock interacts with Redis SET NX and Lua atomic script correctly."""
+        mock_redis = AsyncMock()
+        mock_redis.set.return_value = True
+        mock_redis.eval.return_value = 1
+
+        lock = gateway_module.DistributedLock(
+            resource="lock:module:redis_test_123",
+            ttl_seconds=30,
+            redis_client=mock_redis
+        )
+
+        acq = asyncio.run(lock.acquire())
+        self.assertTrue(acq)
+        mock_redis.set.assert_awaited_once()
+
+        rel = asyncio.run(lock.release())
+        self.assertTrue(rel)
+        mock_redis.eval.assert_awaited_once()
+
+    # -------------------------------------------------------------------------
+    # Issue #3: AWS S3/SQS Ingestion Resilience Tests
+    # -------------------------------------------------------------------------
+    def test_gateway_bulk_analysis_aws_failure_resilience(self):
+        """Gateway analyze_bulk does not fail with HTTP 500 if AWS S3/SQS encounters an error."""
+        self.mock_s3.upload_fileobj.side_effect = Exception("AWS Access Denied / Invalid Credentials")
+        self.mock_sqs.send_message.side_effect = Exception("AWS SQS Unreachable")
+
+        img1_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img1_path, "rb") as f1:
+            f1_bytes = f1.read()
+
+        async def dummy_worker_dispatch(*args, **kwargs):
+            return {
+                "module_id": "MOD-2026-999",
+                "filename": "scan_module_6x10_pass.png",
+                "status": "PASS",
+                "rows": 6,
+                "cols": 10,
+                "total_cells": 60,
+                "defective_cells_count": 0,
+                "module_damage_percentage": 0.0,
+                "processed_by_node": "worker-1",
+                "cells": []
+            }
+
+        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=dummy_worker_dispatch):
+            files = [("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png"))]
+            response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["batch_summary"]["total_modules"], 1)
+
+        self.mock_s3.upload_fileobj.side_effect = None
+        self.mock_sqs.send_message.side_effect = None
+
+    def test_gateway_cluster_election_endpoint(self):
+        """Gateway POST /api/v1/cluster/election triggers re-election simulation."""
+        response = self.gateway_client.post("/api/v1/cluster/election?action=step_down")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "election_triggered")
+        self.assertEqual(data["action"], "step_down")
+        self.assertIn("message", data)
 
 
 if __name__ == "__main__":
