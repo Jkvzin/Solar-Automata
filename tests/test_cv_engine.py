@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cv_engine import (
     DefectType,
+    _trim_cell_gap_margins,
     apply_clahe_normalization,
     classify_cell_yolo,
     classify_cells_batch_yolo,
@@ -475,6 +476,93 @@ class TestCVEngine(unittest.TestCase):
         self.assertEqual(len(annotated.shape), 3)
         # Should have banner height added
         self.assertGreater(annotated.shape[0], 200)
+
+    def test_trim_cell_gap_margins_preserves_central_wafer(self):
+        """
+        Verify that _trim_cell_gap_margins strips dark inter-cell gap borders
+        while preserving the central active silicon wafer.
+        """
+        # Synthesize a 64x64 cell with a 3px dark inter-cell gap border (intensity 18)
+        # surrounding a bright uniform silicon wafer (intensity 175)
+        cell_with_gap = np.full((64, 64), 175, dtype=np.uint8)
+        cell_with_gap[:3, :] = 18
+        cell_with_gap[-3:, :] = 18
+        cell_with_gap[:, :3] = 18
+        cell_with_gap[:, -3:] = 18
+
+        trimmed = _trim_cell_gap_margins(cell_with_gap, trim_ratio=0.05)
+        self.assertLess(trimmed.shape[0], 64)
+        self.assertLess(trimmed.shape[1], 64)
+        self.assertGreaterEqual(trimmed.shape[0], 50)
+        self.assertGreaterEqual(trimmed.shape[1], 50)
+        # All dark border pixels (18) must be removed, leaving only the 175 wafer
+        self.assertEqual(int(trimmed.min()), 175)
+        self.assertEqual(int(trimmed.max()), 175)
+
+    def test_grid_topology_ignores_internal_cell_busbars(self):
+        """
+        Verify that internal horizontal busbars inside EL cells do not cause
+        _detect_1d_dividers to double the row count (e.g., 6x10 mistaken for 12x10).
+        """
+        rows, cols = 6, 10
+        cell_w, cell_h = 80, 80
+        gap_px, border_px = 6, 20
+        total_w = cols * cell_w + (cols - 1) * gap_px + 2 * border_px
+        total_h = rows * cell_h + (rows - 1) * gap_px + 2 * border_px
+        panel = np.full((total_h, total_w), 14, dtype=np.uint8)
+
+        rng = np.random.default_rng(123)
+        for r in range(rows):
+            for c in range(cols):
+                y0 = border_px + r * (cell_h + gap_px)
+                x0 = border_px + c * (cell_w + gap_px)
+                wafer = rng.normal(172, 9, size=(cell_h, cell_w)).clip(120, 220).astype(np.uint8)
+                # Add 3 horizontal internal busbars inside each cell (shallower than deep inter-cell gaps)
+                for frac in (0.25, 0.50, 0.75):
+                    by = int(cell_h * frac)
+                    wafer[max(0, by - 1):min(cell_h, by + 2), :] = 95
+                panel[y0:y0 + cell_h, x0:x0 + cell_w] = wafer
+
+        det_rows, det_cols, y_bounds, x_bounds = detect_grid_topology(panel)
+        self.assertEqual(det_rows, 6)
+        self.assertEqual(det_cols, 10)
+        self.assertEqual(len(y_bounds), 7)
+        self.assertEqual(len(x_bounds), 11)
+
+    def test_evaluate_module_with_yolo_false_alarm_resilience(self):
+        """
+        Verify that evaluate_module(..., use_yolo=True) suppresses false positives on
+        clean/tilted synthetic scans (PASS) while accurately flagging defective modules (FAIL).
+        """
+        pass_fixtures = [
+            ("scan_module_6x10_pass.png", 6, 10),
+            ("scan_module_tilted_6x10.png", 6, 10),
+        ]
+        for fname, exp_r, exp_c in pass_fixtures:
+            with self.subTest(fixture=fname):
+                fpath = self.fixtures_dir / fname
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                res = evaluate_module(data, filename=fname, use_yolo=True)
+                self.assertEqual(res.rows, exp_r)
+                self.assertEqual(res.cols, exp_c)
+                self.assertLess(res.module_damage_percentage, 5.0)
+                self.assertEqual(res.status, "PASS")
+
+        fail_fixtures = [
+            ("scan_module_6x12_fail.png", 6, 12),
+            ("scan_module_12x10_fail.png", 12, 10),
+        ]
+        for fname, exp_r, exp_c in fail_fixtures:
+            with self.subTest(fixture=fname):
+                fpath = self.fixtures_dir / fname
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                res = evaluate_module(data, filename=fname, use_yolo=True)
+                self.assertEqual(res.rows, exp_r)
+                self.assertEqual(res.cols, exp_c)
+                self.assertGreaterEqual(res.module_damage_percentage, 5.0)
+                self.assertEqual(res.status, "FAIL")
 
 
 if __name__ == "__main__":
