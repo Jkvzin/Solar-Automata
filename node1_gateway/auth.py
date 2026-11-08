@@ -54,7 +54,7 @@ DEFAULT_OPERATOR_PASSWORD = os.getenv("DEFAULT_OPERATOR_PASSWORD", "LuminaPV@202
 DEFAULT_OPERATOR_NAME = os.getenv("DEFAULT_OPERATOR_NAME", "Operador Chefe LuminaPV")
 
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
-ALLOWED_ROLES = {"operator", "engineer", "auditor", "admin", "viewer"}
+ALLOWED_ROLES = {"user", "operator", "engineer", "auditor", "admin", "viewer"}
 
 
 # -----------------------------------------------------------------------------
@@ -64,10 +64,10 @@ class UserRecord(BaseModel):
     """Canonical internal user entity persisted in the repository (S3 / Memory)."""
     user_id: str = Field(..., description="Unique immutable UUIDv4 identifier (e.g. usr-...).")
     email: str = Field(..., description="Normalized lowercase email address.")
-    name: str = Field(..., description="Full name of the operator or engineer.")
+    name: str = Field(..., description="Full name of the user.")
     password_hash: str = Field(..., description="PBKDF2-HMAC-SHA256 encoded password hash.")
-    role: str = Field(default="operator", description="Access role: operator | admin | viewer.")
-    is_active: bool = Field(default=True, description="Whether the operator account is active.")
+    role: str = Field(default="operator", description="Access role.")
+    is_active: bool = Field(default=True, description="Whether the account is active.")
     created_at: str = Field(..., description="ISO 8601 UTC creation timestamp.")
     updated_at: str = Field(..., description="ISO 8601 UTC last update timestamp.")
     last_login_at: Optional[str] = Field(default=None, description="ISO 8601 UTC last login timestamp.")
@@ -87,10 +87,11 @@ class UserPublicDTO(BaseModel):
 
 class RegisterRequest(BaseModel):
     """Payload contract for POST /api/auth/register."""
-    name: str = Field(..., min_length=2, max_length=120, description="Full operator name")
-    email: str = Field(..., min_length=5, max_length=180, description="Corporate or local email")
+    name: str = Field(..., min_length=2, max_length=120, description="Full user name")
+    email: str = Field(..., min_length=5, max_length=180, description="Email address")
     password: str = Field(..., min_length=8, max_length=128, description="Password (min 8 characters)")
-    role: Optional[str] = Field(default="operator", description="Role: operator | admin | viewer")
+    password_confirm: Optional[str] = Field(default=None, max_length=128, description="Optional password confirmation")
+    role: Optional[str] = Field(default="operator", description="Optional role")
 
 
 class LoginRequest(BaseModel):
@@ -645,6 +646,12 @@ async def register_operator(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A senha deve possuir no mínimo 8 caracteres."
+        )
+
+    if payload.password_confirm is not None and payload.password != payload.password_confirm:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="As senhas informadas não coincidem."
         )
 
     role_norm = (payload.role or "operator").strip().lower()

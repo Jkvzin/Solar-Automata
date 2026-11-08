@@ -862,19 +862,33 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             self.assertTrue(any(k.startswith(f"users/{user_id}/scans/") and k.endswith("_module_el_01.png") for k in put_keys))
             self.assertTrue(any(k.startswith(f"users/{user_id}/reports/") and k.endswith("_MOD-PART-001.json") for k in put_keys))
 
-            # Verify anonymous fallback partitioning when no token is provided
+            # Verify unauthenticated upload is NOT persisted to S3 (kept local-only)
             self.mock_s3.put_object.reset_mock()
             anon_resp = self.gateway_client.post(
                 "/api/v1/analyze/bulk",
                 files=[("files", ("anon_scan.png", b"anon_bytes", "image/png"))],
             )
             self.assertEqual(anon_resp.status_code, 200)
-            anon_keys = [
+            anon_mod = anon_resp.json()["modules"][0]
+            self.assertFalse(anon_mod.get("persisted_in_s3"))
+            self.assertEqual(anon_mod.get("storage_scope"), "local")
+            self.assertIsNone(anon_mod.get("s3_image_key"))
+            self.assertIsNone(anon_mod.get("s3_report_key"))
+            self.assertEqual(self.mock_s3.put_object.call_count, 0)
+
+            # Verify syncing local unauthenticated modules upon login saves them to S3 without reprocessing
+            sync_resp = self.gateway_client.post(
+                "/api/v1/user/history/sync",
+                json={"modules": [anon_mod]},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(sync_resp.status_code, 200)
+            sync_keys = [
                 call.kwargs.get("Key") or (call.args[1] if len(call.args) > 1 else "")
                 for call in self.mock_s3.put_object.call_args_list
             ]
-            self.assertTrue(any(k.startswith("anonymous/scans/") for k in anon_keys))
-            self.assertTrue(any(k.startswith("anonymous/reports/") for k in anon_keys))
+            self.assertTrue(any(k.startswith(f"users/{user_id}/scans/") and k.endswith("_anon_scan.png") for k in sync_keys))
+            self.assertTrue(any(k.startswith(f"users/{user_id}/reports/") and k.endswith(".json") for k in sync_keys))
 
     def test_get_user_history_requires_auth(self):
         """Confirms HTTP 401 when accessing /api/v1/user/history without a valid Bearer JWT token."""
