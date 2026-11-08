@@ -7,7 +7,7 @@
 [![SciPy](https://img.shields.io/badge/SciPy-1.11+-8CAAE6.svg?logo=scipy)](https://scipy.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker)](https://www.docker.com/)
 [![Google Cloud Run](https://img.shields.io/badge/GCP-Cloud_Run-4285F4.svg?logo=googlecloud)](https://cloud.google.com/run)
-[![Tests Passing](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-43%2F43%20passing-brightgreen.svg)]()
 [![Status](https://img.shields.io/badge/status-production--ready-success.svg)]()
 
 **Solar-Automata** is a high-performance, distributed computer vision platform designed for automated optical quality assurance (QA) and electroluminescence (EL) diagnostic inspection of solar photovoltaic (PV) modules. 
@@ -130,31 +130,37 @@ Solar-Automata/
 │       ├── render.js                  # DOM rendering pipeline (viewport, plate, inspector)
 │       └── app.js                     # Pan/zoom, events, shortcuts & boot sequence
 │
-├── node1_gateway/                     # API Gateway & Batch Orchestrator (FastAPI)
-│   ├── main.py                        # Bulk ingestion, async gather & static host
-│   ├── requirements.txt               # Gateway dependencies (fastapi, httpx, uvicorn)
+├── node1_gateway/                     # API Gateway, Auth, History & Orchestrator (FastAPI)
+│   ├── main.py                        # Bulk ingestion, DistributedLock, Round-Robin & telemetry
+│   ├── auth.py                        # Stateless JWT (HS256), PBKDF2-SHA256 & S3/Memory user repo
+│   ├── history.py                     # Operator scan history, S3 partitioning & pre-signed URLs
+│   ├── requirements.txt               # Gateway dependencies (fastapi, httpx, redis, boto3)
 │   └── Dockerfile                     # Production container spec
 │
 ├── node2_worker/                      # Computer Vision Worker (FastAPI + OpenCV + YOLOv8-cls)
-│   ├── main.py                        # REST endpoints, heartbeat registry & replication manager
-│   ├── cv_engine.py                   # Dynamic Sobel grid detection & batch YOLOv8-cls engine
+│   ├── main.py                        # REST endpoints, heartbeat registry, leader election & LRU cache
+│   ├── cv_engine.py                   # CLAHE, 4-line hull homography, dynamic slicing & batch YOLOv8-cls
 │   ├── models/best.pt                 # Trained YOLOv8-cls solar cell classification weights
 │   ├── requirements.txt               # Worker dependencies (opencv, scipy, ultralytics, redis)
 │   └── Dockerfile                     # Production container spec (Debian + GL/X11 libs)
 │
+├── docs/                              # Technical & Architectural Reports
+│   └── entrega_3_relatorio.md         # Complete Delivery 3 Distributed Systems Report & Runbook
+│
 ├── fixtures/                          # Sample batch payloads for instant testing
 │   └── luminapv-batch-sample.json     # Pre-analyzed batch dataset
 │
-├── tests/                             # Comprehensive automated test suite
+├── tests/                             # Comprehensive automated test suite (43 tests)
 │   ├── fixtures/                      # Sample synthetic scans & reference EL imagery
 │   │   ├── scan_module_6x10_pass.png
 │   │   ├── scan_module_6x12_fail.png
 │   │   ├── scan_module_12x10_fail.png
 │   │   └── scan_module_tilted_6x10.png
 │   ├── generate_test_modules.py       # Deterministic EL solar panel scan generator
-│   ├── test_cv_engine.py              # Unit tests for CV algorithms & batch YOLOv8-cls
-│   └── test_api_integration.py        # Integration tests for distributed endpoints & replicas
+│   ├── test_cv_engine.py              # Unit tests for CV homography, Half-Cut & batch YOLOv8-cls
+│   └── test_api_integration.py        # Integration tests for coordination, naming, replication & auth
 │
+├── test_panel.py                      # Standalone CLI end-to-end panel diagnostic script
 ├── docker-compose.yml                 # Multi-container orchestration (Registry + 2 Workers + Gateway)
 ├── DEPLOYMENT_GCP.md                  # Complete Google Cloud Run deployment manual
 ├── brand-spec.md                      # UI tokens & industrial design system specifications
@@ -175,7 +181,7 @@ Requires Docker and Docker Compose installed:
 git clone https://github.com/Jkvzin/Solar-Automata.git
 cd Solar-Automata
 
-# Build images and start services in the background (Registry + 2 Workers + Gateway)
+# Build images and start services (Registry + 2 Workers + Gateway)
 docker compose up --build -d
 
 # Verify container health
@@ -185,8 +191,20 @@ docker compose ps
 docker compose logs -f
 ```
 
-Open your browser at:
-👉 **[http://localhost:8080/](http://localhost:8080/)**
+#### Service Ports & Internal DNS Mapping
+
+| Container / Service | Host Port | Internal DNS Alias (`.luminapv.local`) | Role |
+| :--- | :--- | :--- | :--- |
+| **`node1_gateway`** | `http://localhost:8080` | `gateway.luminapv.local:8080` | LuminaPV Web Console, Auth JWT, History, Distributed Lock & Round-Robin Router |
+| **`node2-worker-1`** | `http://localhost:8001` | `worker-1.luminapv.local:8001` | Vision Worker Replica 1 (Homography, Batch YOLOv8-cls, Leader Election & Cache) |
+| **`node2-worker-2`** | `http://localhost:8002` | `worker-2.luminapv.local:8001` | Vision Worker Replica 2 (Homography, Batch YOLOv8-cls, Leader Election & Cache) |
+| **`luminapv-registry`** | `localhost:6379` | `state.luminapv.local:6379` / `redis.luminapv.local` | Distributed State Store (Service Discovery, Leader Leases, Lua Locks & Primary Replica Cache) |
+
+#### Default Operator Credentials (LuminaPV Console)
+When accessing **[http://localhost:8080/](http://localhost:8080/)**, you can inspect batches anonymously or authenticate with the pre-seeded industrial operator account:
+- **E-mail:** `operador@luminapv.local`
+- **Password:** `LuminaPV@2026`
+- **Role:** `operator` (Operador Chefe LuminaPV)
 
 To shut down the cluster:
 ```bash
@@ -321,6 +339,8 @@ Solar-Automata is fully containerized and production-ready for deployment on **G
 
 ## 9. Distributed Systems Architecture (Entrega 3)
 
+> 📄 **Relatório Técnico Completo da Entrega 3:** Consulte **[docs/entrega_3_relatorio.md](docs/entrega_3_relatorio.md)** para o detalhamento arquitetural completo, mapeamento de PRs/Issues e runbook de verificação.
+
 ### 9.1. Esquema de Nomeação e Descoberta de Serviços (Naming & Service Discovery)
 O cluster utiliza um esquema híbrido composto por **DNS estruturado na rede interna Docker** (`*.luminapv.local`) e **Catálogo Dinâmico com Auto-Registro via Heartbeat**:
 - **Domínio Interno Padronizado**:
@@ -329,19 +349,19 @@ O cluster utiliza um esquema híbrido composto por **DNS estruturado na rede int
   - `worker-1.luminapv.local` (`node2-worker-1` — Porta `8001`)
   - `worker-2.luminapv.local` (`node2-worker-2` — Porta `8002` externa / `8001` interna)
 - **Identificador Lógico de Serviço**: `service://luminapv-vision-worker`.
-- **Protocolo de Heartbeat**: Cada réplica de `node2_worker` executa um ciclo assíncrono em background (`HEARTBEAT_INTERVAL_SECONDS = 3.0s`) gravando seus metadados (`node_id`, `dns_name`, `endpoint`, `role`, `term`, `leader_id`, `model_sha256`, `last_seen`) na chave `luminapv:services:vision-worker:<node_id>` com expiração automática (`TTL = 10s`), permitindo detecção rápida de falhas e remoção imediata de nós inativos.
+- **Protocolo de Heartbeat e Desregistro Gracioso (`WorkerServiceRegistry`)**: Cada réplica de `node2_worker` executa um ciclo assíncrono em background (`HEARTBEAT_INTERVAL_SECONDS = 3.0s`) gravando seus metadados (`node_id`, `dns_name`, `endpoint`, `role`, `term`, `leader_id`, `model_sha256`, `last_seen`) na chave `luminapv:services:vision-worker:<node_id>` com expiração automática (`TTL = 10s`) e indexação no Set `luminapv:services:vision-worker:nodes`. No encerramento (`stop()`), o worker remove sua chave e executa `SREM` no conjunto para limpeza imediata.
 - **Roteamento, Balanceamento e Failover Dinâmico (`node1_gateway`)**: O resolvedor `ServiceCatalogResolver` consulta as instâncias saudáveis no catálogo e distribui os módulos do lote via **Round-Robin** concorrente (`asyncio.gather`). Caso uma instância falhe durante a transmissão, o gateway redireciona a requisição automaticamente para o próximo worker saudável registrado (*failover* transparente).
-- **Telemetria Consolidada do Cluster**: O endpoint `GET /api/v1/cluster/status` expõe o líder eleito, termo, nós ativos, esquema de nomeação, locks distribuídos em vigor e estatísticas de replicação.
+- **Telemetria Consolidada e Observabilidade em Tempo Real**: O endpoint `GET /api/v1/cluster/status` expõe o líder eleito, termo, nós ativos, esquema de nomeação, locks distribuídos em vigor e estatísticas de replicação, alimentando a aba **Topologia do Cluster** no frontend (polling a cada `4s` com pausa automática via `visibilitychange` e detecção de desconexão).
 
 ### 9.2. Mecanismos de Coordenação (Eleição de Líder e Exclusão Mútua)
-- **Eleição de Líder entre Workers (`node2_worker`)**: Os nós ativos disputam um *lease* atômico distribuído no Redis (`SET luminapv:leader <payload> NX EX 8`) com renovação periódica. O nó eleito assume papel `LEADER`, incrementa o termo e atualiza o lease; as demais réplicas operam como `FOLLOWER`. Se o líder cair (`docker stop`), o lease expira em 8 segundos e os seguidores detectam a vacância, elegendo um novo líder em até 5–10 segundos. O estado é exposto em `GET /health` (`role`, `term`, `leader_id`) e pode ser testado via `POST /api/v1/cluster/election`.
-- **Exclusão Mútua Distribuída (`DistributedLock` no `node1_gateway`)**: O processamento concorrente de módulos no `POST /api/v1/analyze/bulk` adquire locks atômicos no Redis baseados no hash SHA-256 do arquivo (`lock:module:<sha256>`) com TTL contra *deadlocks* e liberação atômica em bloco `finally` via script Lua (`_LUA_RELEASE_LOCK`). Locks ativos são rastreados em `luminapv:active_locks`.
-- **Resiliência na Ingestão AWS**: As chamadas AWS S3/SQS em `analyze_bulk` são configuráveis via variável de ambiente (`AWS_INGESTION_ENABLED`) e protegidas por `try/except`, garantindo continuidade operacional sem erro HTTP 500 em execuções locais ou Docker sem credenciais na nuvem.
+- **Eleição de Líder entre Workers (`LeaderElectionManager` em `node2_worker`)**: Os nós ativos disputam um *lease* atômico distribuído no Redis (`SET luminapv:leader <payload> NX EX 8`) com renovação periódica a cada `2s`. O nó eleito assume papel `LEADER`, incrementa o termo monotônico (`INCR luminapv:leader:term`) e renova o lease; as demais réplicas operam como `FOLLOWER`. Se o líder cair (`docker stop`), o lease expira em 8 segundos e os seguidores assumem a liderança automaticamente. O estado é exposto em `GET /health` (`role`, `term`, `leader_id`) e pode ser simulado via `POST /api/v1/cluster/election?action=step_down|reelect`.
+- **Exclusão Mútua Distribuída (`DistributedLock` no `node1_gateway`)**: O processamento concorrente de módulos no `POST /api/v1/analyze/bulk` protege a seção crítica adquirindo locks atômicos no Redis baseados no hash SHA-256 do arquivo (`lock:module:<sha256>`) com `SET NX EX 30` contra *deadlocks* e liberação atômica em bloco `finally` via script Lua (`_LUA_RELEASE_LOCK`), que valida o token de propriedade antes de remover o lock e atualizar o hash `luminapv:active_locks`.
+- **Resiliência na Ingestão AWS, Autenticação JWT e Histórico S3**: As chamadas AWS S3/SQS em `analyze_bulk`, a autenticação de operadores (`node1_gateway/auth.py`) e a galeria de histórico (`node1_gateway/history.py`) operam sob arquitetura *Ports & Adapters* com fallback transparente em memória, garantindo funcionamento pleno sem erro HTTP 500 em execuções locais ou Docker offline.
 
 ### 9.3. Replicação de Dados/Modelos e Especificação Formal do Modelo de Consistência
-- **Estratégia de Replicação (*Primary-Backup* + Cache Distribuído de Inferência)**:
-  - Todo resultado de inspeção (`ModuleResult`) processado por um worker é indexado pelo hash SHA-256 do conteúdo da imagem (`luminapv:replica:module:<content_sha256>`) e replicado simultaneamente no store primário compartilhado (`state.luminapv.local`) e nos stores em memória locais das réplicas (`_LOCAL_REPLICA_STORE`).
-  - **Consistência de Pesos de IA (`model_sha256`)**: Cada registro replicado armazena o hash SHA-256 do arquivo de pesos `best.pt` (YOLOv8-cls). Ao consultar uma réplica em cache, o worker valida se `cached.model_sha256 == local.model_sha256`, invalidando automaticamente caches antigos caso o modelo seja atualizado.
+- **Estratégia de Replicação (*Primary-Backup* + Cache Distribuído LRU de Inferência)**:
+  - Todo resultado de inspeção (`ModuleResult`) processado por um worker é indexado pelo hash SHA-256 do conteúdo da imagem (`luminapv:replica:module:<content_sha256>:yolo=<0|1>`) e replicado simultaneamente no store primário compartilhado (`state.luminapv.local`) com `TTL=3600s` e nos stores locais das réplicas (`LRUReplicaStore` baseado em `OrderedDict` com limite configurável `MAX_LOCAL_REPLICAS=500`).
+  - **Consistência de Pesos de IA (`model_sha256`) e Tolerância a Evolução de Schema**: Cada registro replicado armazena o hash SHA-256 do arquivo de pesos `best.pt` (YOLOv8-cls). Ao consultar o cache, o worker valida `cached.model_sha256 == local.model_sha256` (prevenindo *model drift*) e protege a desserialização `ModuleResult(**cloned)` com fallback seguro para *cache miss* em caso de mudança de schema. O endpoint `GET /api/v1/replicas/stats` higieniza automaticamente chaves expiradas do índice `luminapv:replica:modules:index`.
 - **Definição Formal do Modelo de Consistência**:
   1. **Consistência *Read-Your-Writes* (Leitura das Próprias Escritas — Centrada no Cliente)**:
      - Toda operação `POST /api/v1/process-module` ou `POST /api/v1/analyze/bulk` confirma a gravação síncrona no store primário antes de responder ao cliente. Assim, qualquer leitura subsequente realizada pelo mesmo operador ou pelo console web (`GET /api/v1/replicas/{sha256}` ou reenvio de lote) enxerga garantidamente a versão mais recente escrita.

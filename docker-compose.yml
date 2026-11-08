@@ -33,6 +33,7 @@ services:
       - SERVICE_NAME=service://luminapv-vision-worker
       - WORKER_DNS_NAME=worker-1.luminapv.local
       - REDIS_URL=redis://state.luminapv.local:6379/0
+      - MAX_LOCAL_REPLICAS=${MAX_LOCAL_REPLICAS:-500}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node2_worker/main.py:/app/main.py
@@ -68,6 +69,7 @@ services:
       - SERVICE_NAME=service://luminapv-vision-worker
       - WORKER_DNS_NAME=worker-2.luminapv.local
       - REDIS_URL=redis://state.luminapv.local:6379/0
+      - MAX_LOCAL_REPLICAS=${MAX_LOCAL_REPLICAS:-500}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node2_worker/main.py:/app/main.py
@@ -101,6 +103,9 @@ services:
       - WORKER_SERVICE_URL=http://worker-1.luminapv.local:8001
       - WORKER_SERVICE_NAME=service://luminapv-vision-worker
       - REDIS_URL=redis://state.luminapv.local:6379/0
+      - AUTH_STORAGE_BACKEND=${AUTH_STORAGE_BACKEND:-memory}
+      - AUTH_ENFORCE_PROTECTED_ROUTES=${AUTH_ENFORCE_PROTECTED_ROUTES:-false}
+      - AWS_INGESTION_ENABLED=${AWS_INGESTION_ENABLED:-false}
       - PYTHONUNBUFFERED=1
     volumes:
       - ./node1_gateway/main.py:/app/main.py
