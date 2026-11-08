@@ -711,12 +711,100 @@ function renderAll() {
   renderInspector();
   renderJson();
   renderTopology();
+  renderAuthUI();
   setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
   var dd = $("#dockDist");
   if (state.distAnimated && dd && !dd.hidden) {
     state.distValues = distData();
     drawDist(1);
   }
+}
+
+/* ---------- render: authentication UI & modal ---------- */
+function renderAuthUI() {
+  var a = state.auth || {};
+  var badge = $("#authUserBadge");
+  var btnLabel = $("#authBtnLabel");
+  var alertBox = $("#authAlert");
+  var submitBtn = $("#authSubmitBtn");
+  var nameField = $("#authNameField");
+  var confirmField = $("#authConfirmField");
+  var roleField = $("#authRoleField");
+  var demoRow = $("#authDemoRow");
+  var tabLogin = $("#authTabLogin");
+  var tabReg = $("#authTabRegister");
+
+  var isReg = a.mode === "register";
+  if (tabLogin) tabLogin.setAttribute("aria-selected", isReg ? "false" : "true");
+  if (tabReg) tabReg.setAttribute("aria-selected", isReg ? "true" : "false");
+  if (nameField) nameField.hidden = !isReg;
+  if (confirmField) confirmField.hidden = !isReg;
+  if (roleField) roleField.hidden = !isReg;
+  if (demoRow) demoRow.hidden = isReg;
+
+  if (badge) {
+    if (a.authenticated && a.user) {
+      var roleTag = String(a.user.role || "operator").toUpperCase();
+      badge.className = "tag-auth-ok";
+      badge.textContent = "OPERADOR: " + a.user.name + " [" + roleTag + "]";
+      badge.title = "Autenticado como " + a.user.email + " (storage: " + (a.user.storage_backend || "memory") + ")";
+    } else {
+      badge.className = "tag-replica";
+      badge.textContent = "SESSÃO: NÃO AUTENTICADO";
+      badge.title = "Clique em Autenticar para iniciar sessão de operador";
+    }
+  }
+
+  if (btnLabel) {
+    btnLabel.textContent = (a.authenticated && a.user) ? "Sair" : "Autenticar";
+  }
+
+  if (alertBox) {
+    if (a.error) {
+      alertBox.hidden = false;
+      alertBox.textContent = a.error;
+    } else {
+      alertBox.hidden = true;
+      alertBox.textContent = "";
+    }
+  }
+
+  if (submitBtn) {
+    submitBtn.disabled = !!a.loading;
+    if (a.loading) {
+      submitBtn.textContent = isReg ? "Cadastrando..." : "Autenticando...";
+    } else {
+      submitBtn.textContent = isReg ? "Concluir Cadastro" : "Entrar no Console";
+    }
+  }
+}
+
+function setAuthMode(mode) {
+  if (!state.auth) return;
+  state.auth.mode = mode === "register" ? "register" : "login";
+  state.auth.error = null;
+  renderAuthUI();
+  var targetInput = state.auth.mode === "register" ? $("#authName") : $("#authEmail");
+  if (targetInput) setTimeout(function() { targetInput.focus(); }, 20);
+}
+
+function openAuthModal(mode, errorMsg) {
+  var backdrop = $("#authModalBackdrop");
+  if (!backdrop) return;
+  state.auth.mode = mode === "register" ? "register" : "login";
+  state.auth.error = errorMsg || null;
+  backdrop.hidden = false;
+  renderAuthUI();
+  var firstInput = state.auth.mode === "register" ? $("#authName") : $("#authEmail");
+  if (firstInput) setTimeout(function() { firstInput.focus(); }, 30);
+}
+
+function closeAuthModal() {
+  var backdrop = $("#authModalBackdrop");
+  if (!backdrop) return;
+  backdrop.hidden = true;
+  state.auth.error = null;
+  renderAuthUI();
 }
 
 /* ---------- selection ---------- */

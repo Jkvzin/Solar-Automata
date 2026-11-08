@@ -23,13 +23,18 @@ import socket
 from typing import Any, Dict, List, Optional, Annotated
 import uuid
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
+
+try:
+    from node1_gateway.auth import auth_router, verify_optional_or_enforced_auth, UserRecord
+except ImportError:
+    from auth import auth_router, verify_optional_or_enforced_auth, UserRecord
 
 logging.basicConfig(
     level=logging.INFO,
@@ -359,6 +364,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
+
 # Determine paths for frontend console and fixtures
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -570,7 +577,10 @@ async def dispatch_module_to_worker(
     tags=["Analysis"],
     summary="Bulk ingestion and parallel dispatch of photovoltaic module scans"
 )
-async def analyze_bulk(files: list[UploadFile]):
+async def analyze_bulk(
+    files: list[UploadFile],
+    current_user: Optional[UserRecord] = Depends(verify_optional_or_enforced_auth)
+):
     """
     Primary ingestion endpoint for the LuminaPV Console.
     Receives N module images in a single multipart request, protects critical section

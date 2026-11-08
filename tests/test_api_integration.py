@@ -690,6 +690,125 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(data["action"], "step_down")
         self.assertIn("message", data)
 
+    # -------------------------------------------------------------------------
+    # Issue #15: Authentication System & S3 Repository Adapter Tests
+    # -------------------------------------------------------------------------
+    def test_auth_login_default_operator_and_verify_me(self):
+        """POST /api/auth/login authenticates default seeded operator and GET /api/auth/me validates JWT."""
+        login_resp = self.gateway_client.post(
+            "/api/auth/login",
+            json={"email": "operador@luminapv.local", "password": "LuminaPV@2026"},
+        )
+        self.assertEqual(login_resp.status_code, 200)
+        payload = login_resp.json()
+        self.assertIn("access_token", payload)
+        self.assertEqual(payload["token_type"], "Bearer")
+        self.assertEqual(payload["user"]["email"], "operador@luminapv.local")
+
+        token = payload["access_token"]
+        me_resp = self.gateway_client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(me_resp.status_code, 200)
+        me_data = me_resp.json()
+        self.assertEqual(me_data["email"], "operador@luminapv.local")
+
+    def test_auth_register_duplicate_and_logout_revocation(self):
+        """POST /api/auth/register creates new operator, rejects duplicate email (409), and POST /api/auth/logout revokes JWT."""
+        reg_resp = self.gateway_client.post(
+            "/api/auth/register",
+            json={
+                "name": "Engenheira Solar",
+                "email": "eng.solar@luminapv.local",
+                "password": "StrongPassword!123",
+                "role": "engineer",
+            },
+        )
+        self.assertEqual(reg_resp.status_code, 201)
+        reg_data = reg_resp.json()
+        token = reg_data["access_token"]
+        self.assertEqual(reg_data["user"]["email"], "eng.solar@luminapv.local")
+        self.assertEqual(reg_data["user"]["role"], "engineer")
+
+        # Duplicate registration must return 409 Conflict
+        dup_resp = self.gateway_client.post(
+            "/api/auth/register",
+            json={
+                "name": "Engenheira Solar Dup",
+                "email": "eng.solar@luminapv.local",
+                "password": "StrongPassword!123",
+                "role": "engineer",
+            },
+        )
+        self.assertEqual(dup_resp.status_code, 409)
+
+        # Logout revokes token jti
+        logout_resp = self.gateway_client.post(
+            "/api/auth/logout",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(logout_resp.status_code, 200)
+        self.assertEqual(logout_resp.json()["status"], "logged_out")
+
+        # Subsequent /api/auth/me with revoked token must return 401
+        me_after_logout = self.gateway_client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(me_after_logout.status_code, 401)
+
+    def test_s3_user_repository_adapter_contract(self):
+        """S3UserRepository persists and retrieves user records via S3 object keys and falls back gracefully."""
+        from node1_gateway.auth import S3UserRepository, InMemoryUserRepository, UserRecord, hash_password
+        import io
+
+        stored_objects = {}
+
+        mock_s3 = unittest.mock.MagicMock()
+
+        def fake_put_object(Bucket, Key, Body, ContentType):
+            stored_objects[(Bucket, Key)] = Body
+
+        def fake_get_object(Bucket, Key):
+            if (Bucket, Key) not in stored_objects:
+                raise Exception("NoSuchKey")
+            return {"Body": io.BytesIO(stored_objects[(Bucket, Key)])}
+
+        mock_s3.put_object.side_effect = fake_put_object
+        mock_s3.get_object.side_effect = fake_get_object
+
+        repo = S3UserRepository(
+            bucket_name="luminapv-auth-bucket",
+            prefix="auth",
+            s3_client=mock_s3,
+            fallback_repo=InMemoryUserRepository(seed_default=False),
+        )
+
+        record = UserRecord(
+            user_id="usr-test-s3-001",
+            email="s3test@luminapv.local",
+            name="S3 Test Operator",
+            role="admin",
+            password_hash=hash_password("S3SecretPass!99"),
+            created_at="2026-04-17T12:00:00+00:00",
+            updated_at="2026-04-17T12:00:00+00:00",
+        )
+        asyncio.run(repo.create_user(record))
+
+        # Verify both primary object and email index object were written to S3
+        self.assertTrue(
+            any(k.endswith("auth/users/by-id/usr-test-s3-001.json") for (_, k) in stored_objects.keys())
+        )
+        self.assertTrue(
+            any("auth/users/by-email/" in k for (_, k) in stored_objects.keys())
+        )
+
+        fetched_by_email = asyncio.run(repo.get_user_by_email("s3test@luminapv.local"))
+        self.assertIsNotNone(fetched_by_email)
+        self.assertEqual(fetched_by_email.user_id, "usr-test-s3-001")
+        self.assertEqual(fetched_by_email.role, "admin")
+
 
 if __name__ == "__main__":
     unittest.main()

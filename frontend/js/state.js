@@ -27,7 +27,15 @@ var state = {
   cluster: null,
   clusterPollingInterval: null,
   lastLeaderId: null,
-  lastNodesState: {}
+  lastNodesState: {},
+  auth: {
+    token: null,
+    user: null,
+    authenticated: false,
+    loading: false,
+    mode: "login",
+    error: null
+  }
 };
 
 /* ---------- formatting & string helpers ---------- */
