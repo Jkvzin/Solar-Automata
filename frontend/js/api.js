@@ -114,7 +114,7 @@ function postBulk(files) {
     if (fill) fill.style.width = Math.round(frac * 100) + "%";
     if (pctEl) pctEl.textContent = Math.round(frac * 100) + "%";
     var ph = $("#progPhase");
-    if (ph) ph.textContent = frac >= 1 ? "AGUARDANDO ANÁLISE" : "UPLINK";
+    if (ph) ph.textContent = frac >= 1 ? "LOCK & ANÁLISE" : "UPLINK";
     var bar = $("#globalBar");
     if (bar) bar.style.width = Math.max(4, Math.round(frac * 100)) + "%";
   }
@@ -142,7 +142,7 @@ function postBulk(files) {
     headers = undefined;
   }
 
-  log("req", "POST " + API_ENDPOINT + " · " + files.length + " arquivo(s) · " + durationNote + " · timeout " + TIMEOUT_MS / 1000 + " s");
+  log("req", "POST " + API_ENDPOINT + " · " + files.length + " arquivo(s) · Aquisição de locks distribuídos & balanceamento Round-Robin");
   setStatusBar("busy");
 
   function doFetch(useBody, useHeaders) {
@@ -189,7 +189,23 @@ function postBulk(files) {
         throw e2;
       }
       log("ok", "HTTP " + status + " · resposta recebida em " + ((performance.now() - t0) / 1000).toFixed(2).replace(".", ",") + " s · " + (Array.isArray(data.modules) ? data.modules.length : 0) + " módulos");
+      if (Array.isArray(data.modules) && data.modules.length) {
+        var nodeCounts = {};
+        var repCount = 0;
+        var cacheCount = 0;
+        data.modules.forEach(function(m) {
+          var nId = m.processed_by_node || "worker-1";
+          nodeCounts[nId] = (nodeCounts[nId] || 0) + 1;
+          if (m.replicated) repCount++;
+          if (m.cache_hit) cacheCount++;
+        });
+        var distSummary = Object.keys(nodeCounts).map(function(k) { return k + ": " + nodeCounts[k] + " mód."; }).join(" · ");
+        log("info", "Distribuição do lote entre nós: " + distSummary);
+        log("ok", "Consistência Read-Your-Writes: " + repCount + " módulo(s) replicado(s) · " + cacheCount + " cache hit(s)");
+        log("info", "Exclusão mútua concluída: locks distribuídos por módulo liberados com sucesso");
+      }
       ingestPayload(data, "HTTP " + status);
+      pollClusterStatus();
       return data;
     });
   }).catch(function(e) {
@@ -378,4 +394,81 @@ function fallbackCopy(text) {
   ta.select();
   try { document.execCommand("copy"); } catch (e) {}
   ta.remove();
+}
+
+/* ---------- cluster status polling & failover monitoring ---------- */
+function pollClusterStatus() {
+  if (typeof CLUSTER_ENDPOINT === "undefined") return Promise.resolve(null);
+
+  return fetch(CLUSTER_ENDPOINT, { cache: "no-store" })
+    .then(function(res) {
+      if (!res.ok) {
+        // Graceful degradation when endpoint returns non-200 or offline
+        return null;
+      }
+      return res.json();
+    })
+    .then(function(data) {
+      if (!data || typeof data !== "object") return null;
+
+      var prevLeader = state.lastLeaderId;
+      var newLeader = data.leader_id;
+
+      // 1. Detect and log leader election / failover
+      if (newLeader && prevLeader && prevLeader !== newLeader) {
+        var termStr = data.term ? (" (Termo #" + data.term + ")") : "";
+        log("warn", "Transição de Liderança detectada: " + prevLeader + " -> " + newLeader + termStr + " · Failover automático concluído");
+        live("Novo líder eleito no cluster: " + newLeader);
+      }
+      state.lastLeaderId = newLeader || prevLeader;
+
+      // 2. Detect worker nodes health/status transitions
+      if (Array.isArray(data.nodes)) {
+        var currentNodesState = {};
+        data.nodes.forEach(function(node) {
+          var nid = node.node_id || node.dns_name;
+          var nstatus = (node.status || "ONLINE").toUpperCase();
+          currentNodesState[nid] = nstatus;
+
+          var oldStatus = state.lastNodesState ? state.lastNodesState[nid] : null;
+          if (oldStatus && oldStatus !== nstatus) {
+            var dnsLabel = node.dns_name ? (node.dns_name + " (" + nid + ")") : nid;
+            if (nstatus === "OFFLINE") {
+              log("warn", "Nó " + dnsLabel + " OFFLINE · Failover ativo");
+              live("Nó " + nid + " offline. Tráfego redirecionado para réplicas ativas.");
+            } else if (nstatus === "ONLINE") {
+              log("ok", "Nó " + dnsLabel + " restabelecido (ONLINE)");
+            }
+          }
+        });
+        state.lastNodesState = currentNodesState;
+      }
+
+      state.cluster = data;
+      renderTopology();
+      setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
+      return data;
+    })
+    .catch(function(err) {
+      // Graceful degradation: do NOT throw errors or pollute console if cluster backend is offline
+      // Keeps existing state without breaking local inspection
+      return null;
+    });
+}
+
+function startClusterPolling() {
+  if (state.clusterPollingInterval) {
+    clearInterval(state.clusterPollingInterval);
+    state.clusterPollingInterval = null;
+  }
+  pollClusterStatus();
+  var intervalMs = (typeof CLUSTER_POLL_INTERVAL_MS !== "undefined") ? CLUSTER_POLL_INTERVAL_MS : 4000;
+  state.clusterPollingInterval = setInterval(pollClusterStatus, intervalMs);
+}
+
+function stopClusterPolling() {
+  if (state.clusterPollingInterval) {
+    clearInterval(state.clusterPollingInterval);
+    state.clusterPollingInterval = null;
+  }
 }

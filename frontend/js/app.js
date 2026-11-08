@@ -434,6 +434,18 @@ function boot() {
   var sbH = $("#sbHttp");
   if (sbH) sbH.textContent = "HTTP —";
   setStatusBar("idle");
+
+  // Inicia polling de telemetria e coordenação do cluster em tempo real
+  if (typeof startClusterPolling === "function") {
+    startClusterPolling();
+    document.addEventListener("visibilitychange", function() {
+      if (document.hidden) {
+        stopClusterPolling();
+      } else {
+        startClusterPolling();
+      }
+    });
+  }
 }
 
 if (document.readyState === "loading") {
