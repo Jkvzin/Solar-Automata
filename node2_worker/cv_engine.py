@@ -2,9 +2,11 @@
 LuminaPV Computer Vision & Signal Processing Engine (Node 2 Worker)
 ===================================================================
 Author: Principal Distributed Systems Engineer & Senior Computer Vision Architect
-Purpose: Performs perspective normalization, dynamic arbitrary grid topology detection,
-         in-memory cell slicing, and electroluminescence (EL) defect classification
-         for photovoltaic modules.
+Purpose: Performs local contrast normalization (CLAHE), robust quadrilateral contour
+         and corner detection with perspective homography rectification, adaptive
+         projection-profile grid segmentation (supporting Full-Cell and Half-Cut
+         photovoltaic topologies with geometric fallback), in-memory cell slicing,
+         and electroluminescence (EL) defect classification.
 """
 
 import base64
@@ -15,7 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -25,6 +27,10 @@ from scipy.signal import find_peaks
 from ultralytics import YOLO
 
 logger = logging.getLogger("cv_engine")
+
+# Standard commercial PV module cell counts (Full-cell & Half-cut families)
+PLAUSIBLE_CELL_COUNTS = {36, 48, 54, 60, 66, 72, 96, 108, 120, 132, 144}
+STANDARD_FAMILIES = {60, 72, 120, 144}
 
 
 class DefectType(str, Enum):
@@ -82,152 +88,889 @@ class ModuleResult(BaseModel):
     cells: List[CellInspection]
 
 
+# -----------------------------------------------------------------------------
+# 1. Local Contrast Normalization (CLAHE) & Geometric Helpers
+# -----------------------------------------------------------------------------
+def apply_clahe_normalization(
+    gray_img: np.ndarray,
+    clip_limit: float = 2.5,
+    tile_grid_size: Tuple[int, int] = (8, 8)
+) -> np.ndarray:
+    """
+    Applies Contrast Limited Adaptive Histogram Equalization (CLAHE) to normalize
+    local contrast prior to binarization, edge detection, and structural profiling.
+    Preserves uint8 data type and prevents losses under non-uniform EL illumination.
+    """
+    if gray_img is None or gray_img.size == 0:
+        raise ValueError("Cannot apply CLAHE to an empty image.")
+    if len(gray_img.shape) == 3:
+        gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
+    if gray_img.dtype != np.uint8:
+        gray_img = np.clip(gray_img, 0, 255).astype(np.uint8)
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    return clahe.apply(gray_img)
+
+
 def order_quad_points(pts: np.ndarray) -> np.ndarray:
     """
-    Orders 4 quadrilateral coordinates in clockwise order:
+    Orders 4 quadrilateral coordinates in strict clockwise order:
     [top-left, top-right, bottom-right, bottom-left].
+    Uses centroid polar-angle sorting combined with principal edge orientation
+    to prevent self-intersecting (bowtie) quads under rotation up to +/- 45 deg.
     """
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # Top-left has smallest sum
-    rect[2] = pts[np.argmax(s)]  # Bottom-right has largest sum
+    pts_arr = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    center = np.mean(pts_arr, axis=0)
 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # Top-right has smallest difference (x - y)
-    rect[3] = pts[np.argmax(diff)]  # Bottom-left has largest difference (y - x)
+    # Sort vertices clockwise around centroid: atan2 in image coords (y down, x right)
+    angles = np.arctan2(pts_arr[:, 1] - center[1], pts_arr[:, 0] - center[0])
+    sort_idx = np.argsort(angles)
+    cw_pts = pts_arr[sort_idx]
 
-    return rect
+    # Identify top-left (TL) such that the edge TL -> TR is the uppermost horizontal-ish edge
+    best_k = 0
+    best_score = float("inf")
+    for k in range(4):
+        p0 = cw_pts[k]
+        p1 = cw_pts[(k + 1) % 4]
+        edge_vec = p1 - p0
+        edge_angle = abs(math.degrees(math.atan2(float(edge_vec[1]), float(edge_vec[0]))))
+        mid_y = 0.5 * (p0[1] + p1[1])
+        # Top edge must point roughly rightward (angle < 45 deg) and lie above center
+        if edge_angle <= 45.0 and mid_y <= center[1]:
+            if edge_angle < best_score:
+                best_score = edge_angle
+                best_k = k
+
+    if best_score == float("inf"):
+        # Fallback to classical sum/diff heuristic for extreme aspect ratios
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts_arr.sum(axis=1)
+        rect[0] = pts_arr[np.argmin(s)]
+        rect[2] = pts_arr[np.argmax(s)]
+        diff = np.diff(pts_arr, axis=1)
+        rect[1] = pts_arr[np.argmin(diff)]
+        rect[3] = pts_arr[np.argmax(diff)]
+        return rect
+
+    ordered = np.roll(cw_pts, -best_k, axis=0).astype(np.float32)
+    return ordered
 
 
-def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
+def _intersect_lines(
+    line1: Tuple[float, float, float, float],
+    line2: Tuple[float, float, float, float]
+) -> Optional[np.ndarray]:
     """
-    Detects the outer boundary of the photovoltaic module and performs
-    homography rectification via perspective transform if the module is tilted.
-    If the module already occupies the frame upright, preserves the original raster.
+    Computes the analytical intersection (x, y) of two 2D lines represented as
+    (vx, vy, x0, y0) where (vx, vy) is a unit direction vector and (x0, y0) is a point.
+    """
+    vx1, vy1, x1, y1 = line1
+    vx2, vy2, x2, y2 = line2
+    det = vx1 * vy2 - vy1 * vx2
+    if abs(det) < 1e-6:
+        return None
+    dx = x2 - x1
+    dy = y2 - y1
+    t = (dx * vy2 - dy * vx2) / det
+    ix = x1 + t * vx1
+    iy = y1 + t * vy1
+    return np.array([ix, iy], dtype=np.float32)
+
+
+def _fit_quad_from_hull_lines(hull: np.ndarray, img_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    """
+    Reconstructs the exact 4-corner perspective quadrilateral from a Convex Hull
+    by decomposing hull segments into the 4 dominant directional families
+    (Top, Right, Bottom, Left) and intersecting the fitted boundary lines.
+
+    This guarantees accurate corner recovery even when:
+    - Corner solar cells are completely dark/dead (producing chamfered 5-8 vertex hulls),
+    - The panel suffers trapezoidal perspective distortion, or
+    - Minor aluminum frame reflections create localized bumps along an edge.
+    """
+    h, w = img_shape[:2]
+    peri = cv2.arcLength(hull, True)
+    if peri <= 0:
+        return None
+
+    # Fine polygonal approximation of convex hull to extract linear boundary segments
+    approx = cv2.approxPolyDP(hull, 0.003 * peri, True).reshape(-1, 2).astype(np.float32)
+    n_pts = len(approx)
+    if n_pts < 4:
+        return None
+
+    center = np.mean(approx, axis=0)
+    segments = []
+    for i in range(n_pts):
+        p0 = approx[i]
+        p1 = approx[(i + 1) % n_pts]
+        vec = p1 - p0
+        length = float(np.linalg.norm(vec))
+        if length < 4.0:
+            continue
+        angle = math.atan2(float(vec[1]), float(vec[0]))  # (-pi, pi]
+        mid = 0.5 * (p0 + p1)
+        segments.append((length, angle, mid, p0, p1))
+
+    if len(segments) < 4:
+        return None
+
+    # Estimate dominant orientation modulo 90 degrees (pi/2) using 4x angle circular mean
+    sin_sum = sum(seg[0] * math.sin(4.0 * seg[1]) for seg in segments)
+    cos_sum = sum(seg[0] * math.cos(4.0 * seg[1]) for seg in segments)
+    dom_angle = 0.25 * math.atan2(sin_sum, cos_sum)  # in (-pi/4, pi/4]
+
+    cos_a = math.cos(-dom_angle)
+    sin_a = math.sin(-dom_angle)
+
+    # Group segments into 4 side buckets: top, right, bottom, left
+    # Diagonal chamfers from missing dark corner cells (~45 deg) are naturally rejected
+    buckets: Dict[str, List[Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]]] = {
+        "top": [],
+        "right": [],
+        "bottom": [],
+        "left": [],
+    }
+
+    for length, angle, mid, p0, p1 in segments:
+        rel_angle = math.degrees(angle - dom_angle)
+        rel_angle = (rel_angle + 180.0) % 360.0 - 180.0  # (-180, 180]
+
+        rel_mid = mid - center
+        rx = rel_mid[0] * cos_a - rel_mid[1] * sin_a
+        ry = rel_mid[0] * sin_a + rel_mid[1] * cos_a
+
+        abs_rel = abs(rel_angle)
+        if abs_rel <= 28.0 or abs_rel >= 152.0:
+            # Horizontal-family edge
+            if ry < 0:
+                buckets["top"].append((length, angle, mid, p0, p1))
+            else:
+                buckets["bottom"].append((length, angle, mid, p0, p1))
+        elif 62.0 <= abs_rel <= 118.0:
+            # Vertical-family edge
+            if rx > 0:
+                buckets["right"].append((length, angle, mid, p0, p1))
+            else:
+                buckets["left"].append((length, angle, mid, p0, p1))
+
+    if any(len(b) == 0 for b in buckets.values()):
+        return None
+
+    fitted_lines: Dict[str, Tuple[float, float, float, float]] = {}
+    for side, seg_list in buckets.items():
+        # Sort by segment length descending to pick the primary collinear boundary
+        seg_list.sort(key=lambda s: s[0], reverse=True)
+        best_len, best_ang, best_mid, bp0, bp1 = seg_list[0]
+        base_dir = (bp1 - bp0) / max(best_len, 1e-6)
+        base_norm = np.array([-base_dir[1], base_dir[0]], dtype=np.float32)
+
+        # Collect inlier points from collinear segments on the same side (RANSAC consensus)
+        sampled_pts = []
+        for s_len, s_ang, _, sp0, sp1 in seg_list:
+            ang_diff = abs((math.degrees(s_ang - best_ang) + 180.0) % 360.0 - 180.0)
+            if ang_diff > 180.0:
+                ang_diff = 360.0 - ang_diff
+            dist_p0 = abs(float(np.dot(sp0 - bp0, base_norm)))
+            dist_p1 = abs(float(np.dot(sp1 - bp0, base_norm)))
+            if (ang_diff <= 6.0 or abs(ang_diff - 180.0) <= 6.0) and max(dist_p0, dist_p1) <= 6.0:
+                n_samples = max(2, int(s_len // 5))
+                for t in np.linspace(0.0, 1.0, n_samples):
+                    sampled_pts.append(sp0 * (1.0 - t) + sp1 * t)
+
+        pts_array = np.array(sampled_pts, dtype=np.float32)
+        if len(pts_array) >= 2:
+            line_params = cv2.fitLine(pts_array, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+            fitted_lines[side] = (
+                float(line_params[0]),
+                float(line_params[1]),
+                float(line_params[2]),
+                float(line_params[3]),
+            )
+        else:
+            fitted_lines[side] = (
+                float(base_dir[0]),
+                float(base_dir[1]),
+                float(bp0[0]),
+                float(bp0[1]),
+            )
+
+    tl = _intersect_lines(fitted_lines["top"], fitted_lines["left"])
+    tr = _intersect_lines(fitted_lines["top"], fitted_lines["right"])
+    br = _intersect_lines(fitted_lines["bottom"], fitted_lines["right"])
+    bl = _intersect_lines(fitted_lines["bottom"], fitted_lines["left"])
+
+    if any(pt is None for pt in (tl, tr, br, bl)):
+        return None
+
+    quad = np.array([tl, tr, br, bl], dtype=np.float32)
+    # Sanity check: intersections must lie within reasonable image margin
+    margin_lim = 0.25 * max(w, h)
+    if (
+        np.any(quad[:, 0] < -margin_lim)
+        or np.any(quad[:, 0] > w + margin_lim)
+        or np.any(quad[:, 1] < -margin_lim)
+        or np.any(quad[:, 1] > h + margin_lim)
+    ):
+        return None
+
+    ordered = order_quad_points(quad)
+    if not cv2.isContourConvex(ordered.reshape(-1, 1, 2)):
+        return None
+
+    return ordered
+
+
+def _is_quad_already_orthogonal_full_frame(
+    ordered_quad: np.ndarray,
+    img_shape: Tuple[int, int]
+) -> bool:
+    """
+    Checks whether a detected 4-point quadrilateral already occupies the full frame
+    in an upright, orthogonal orientation (no significant rotation or trapezoidal skew).
+    """
+    h, w = img_shape[:2]
+    tl, tr, br, bl = ordered_quad
+
+    margin_thresh = max(35.0, float(min(w, h)) * 0.08)
+    corners_near_frame = (
+        tl[0] <= margin_thresh
+        and tl[1] <= margin_thresh
+        and (w - tr[0]) <= margin_thresh
+        and tr[1] <= margin_thresh
+        and (w - br[0]) <= margin_thresh
+        and (h - br[1]) <= margin_thresh
+        and bl[0] <= margin_thresh
+        and (h - bl[1]) <= margin_thresh
+    )
+    if not corners_near_frame:
+        return False
+
+    # Check edge angles for rotation
+    top_angle = abs(math.degrees(math.atan2(float(tr[1] - tl[1]), float(tr[0] - tl[0]))))
+    bot_angle = abs(math.degrees(math.atan2(float(br[1] - bl[1]), float(br[0] - bl[0]))))
+    left_angle = abs(math.degrees(math.atan2(float(bl[1] - tl[1]), float(bl[0] - tl[0]))) - 90.0)
+    right_angle = abs(math.degrees(math.atan2(float(br[1] - tr[1]), float(br[0] - tr[0]))) - 90.0)
+
+    if max(top_angle, bot_angle, left_angle, right_angle) > 0.65:
+        return False
+
+    # Check trapezoidal length symmetry
+    w_top = float(np.linalg.norm(tr - tl))
+    w_bot = float(np.linalg.norm(br - bl))
+    h_left = float(np.linalg.norm(bl - tl))
+    h_right = float(np.linalg.norm(br - tr))
+
+    if abs(w_top - w_bot) > max(6.0, 0.015 * w) or abs(h_left - h_right) > max(6.0, 0.015 * h):
+        return False
+
+    return True
+
+
+def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Robustly detects the 4 outer corners [TL, TR, BR, BL] of the PV module using:
+    1. Local contrast normalization (CLAHE) + bilateral/Gaussian smoothing.
+    2. Dual-stage segmentation:
+       - Substrate-aware foreground extraction (handles dark/dead peripheral cells
+         and anodized module frames against dark test-bench backgrounds).
+       - Adaptive Canny edge + CLAHE Otsu active matrix segmentation with
+         morphological bridging and reflection/bench-noise suppression.
+    3. Convex Hull + 4-side collinear line fitting & intersection to reconstruct
+       missing corners caused by dead corner cells or perspective distortion.
     """
     h, w = gray_img.shape[:2]
     img_area = float(w * h)
 
-    blurred = cv2.GaussianBlur(gray_img, (7, 7), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    clahe_img = apply_clahe_normalization(gray_img, clip_limit=2.5, tile_grid_size=(8, 8))
+    blurred_raw = cv2.GaussianBlur(gray_img, (5, 5), 0)
+    blurred_clahe = cv2.GaussianBlur(clahe_img, (5, 5), 0)
 
-    k_size = max(15, int(min(w, h) * 0.04))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    # Estimate test-bench background from outermost 2px perimeter
+    top_b = blurred_raw[:2, :].ravel()
+    bot_b = blurred_raw[-2:, :].ravel()
+    left_b = blurred_raw[:, :2].ravel()
+    right_b = blurred_raw[:, -2:].ravel()
+    border_pixels = np.concatenate([top_b, bot_b, left_b, right_b])
+    bg_p15 = float(np.percentile(border_pixels, 15))
+    bg_median = float(np.median(border_pixels))
 
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return gray_img
+    k_close_size = max(15, int(min(w, h) * 0.045))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close_size, k_close_size))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    largest_c = max(contours, key=cv2.contourArea)
-    bx, by, bw, bh = cv2.boundingRect(largest_c)
+    candidate_hulls: List[np.ndarray] = []
 
-    # Check if the module already occupies the frame upright with standard border
-    margin_thresh = max(35, int(min(w, h) * 0.08))
-    is_full_frame = (
-        bx <= margin_thresh and
-        by <= margin_thresh and
-        (w - (bx + bw)) <= margin_thresh and
-        (h - (by + bh)) <= margin_thresh
+    # Stage A: Substrate + frame segmentation when module sits on a darker test bench
+    # Captures the entire panel board including dark/dead border cells (intensity ~15-35)
+    if bg_p15 < 14.0:
+        sub_thresh_val = max(bg_p15 + 6.0, min(bg_median + 5.0, 14.0))
+        _, sub_mask = cv2.threshold(blurred_raw, int(sub_thresh_val), 255, cv2.THRESH_BINARY)
+        sub_opened = cv2.morphologyEx(sub_mask, cv2.MORPH_OPEN, kernel_open)
+        sub_closed = cv2.morphologyEx(sub_opened, cv2.MORPH_CLOSE, kernel_close)
+        cnts_sub, _ = cv2.findContours(sub_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts_sub:
+            largest_sub = max(cnts_sub, key=cv2.contourArea)
+            if cv2.contourArea(largest_sub) > 0.15 * img_area:
+                candidate_hulls.append(cv2.convexHull(largest_sub))
+
+    # Stage B: CLAHE + Adaptive Otsu + Adaptive Canny Edges
+    _, otsu_clahe = cv2.threshold(blurred_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    med_val = float(np.median(blurred_clahe))
+    canny_low = int(max(15.0, 0.45 * med_val))
+    canny_high = int(min(240.0, max(60.0, 1.35 * med_val)))
+    edges = cv2.Canny(blurred_clahe, canny_low, canny_high)
+
+    # Combine CLAHE binary mask with internal/boundary Canny edges, suppress bench noise
+    combined_mask = cv2.bitwise_or(otsu_clahe, edges)
+    cleaned_mask = cv2.morphologyEx(otsu_clahe, cv2.MORPH_OPEN, kernel_open)
+    bridged_mask = cv2.morphologyEx(
+        cv2.bitwise_or(cleaned_mask, edges),
+        cv2.MORPH_CLOSE,
+        kernel_close
     )
-    if is_full_frame:
+
+    cnts_clahe, _ = cv2.findContours(bridged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts_clahe:
+        # Filter out small background bench noise blobs (< 0.4% of frame area)
+        valid_cnts = [c for c in cnts_clahe if cv2.contourArea(c) > 0.004 * img_area]
+        if valid_cnts:
+            largest_clahe = max(valid_cnts, key=cv2.contourArea)
+            if cv2.contourArea(largest_clahe) > 0.12 * img_area:
+                candidate_hulls.append(cv2.convexHull(largest_clahe))
+
+    if not candidate_hulls:
+        return None
+
+    # Prefer the hull that yields a clean 4-line quad with largest valid area
+    best_quad: Optional[np.ndarray] = None
+    best_area = -1.0
+
+    for hull in candidate_hulls:
+        quad = _fit_quad_from_hull_lines(hull, (h, w))
+        if quad is None:
+            rect = cv2.minAreaRect(hull)
+            quad = order_quad_points(cv2.boxPoints(rect).astype(np.float32))
+
+        q_area = float(cv2.contourArea(quad.reshape(-1, 1, 2)))
+        if q_area > 0.12 * img_area and q_area > best_area:
+            best_area = q_area
+            best_quad = quad
+
+    return best_quad
+
+
+def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
+    """
+    Detects the outer boundary of the photovoltaic module using CLAHE contrast
+    normalization, Canny edge / Convex Hull 4-line intersection, and performs
+    homography rectification via perspective transform if the module is rotated
+    or trapezoidally distorted.
+    If the module already occupies the frame upright and orthogonal, preserves
+    the original raster.
+    """
+    if gray_img is None or gray_img.size == 0:
+        raise ValueError("Input image to normalize_perspective is empty.")
+
+    if len(gray_img.shape) == 3:
+        gray_img = cv2.cvtColor(gray_img, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray_img.shape[:2]
+    ordered = detect_panel_quadrilateral(gray_img)
+    if ordered is None:
         return gray_img
 
-    # If tilted or framed inside a larger background (15% to 85% area)
-    area = cv2.contourArea(largest_c)
-    if area > (0.15 * img_area):
-        peri = cv2.arcLength(largest_c, True)
-        approx = cv2.approxPolyDP(largest_c, 0.02 * peri, True)
+    # Preserve original raster if already orthogonal and full-frame
+    if _is_quad_already_orthogonal_full_frame(ordered, (h, w)):
+        return gray_img
 
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            pts = approx.reshape(4, 2).astype("float32")
-        else:
-            rect = cv2.minAreaRect(largest_c)
-            pts = cv2.boxPoints(rect).astype("float32")
+    tl, tr, br, bl = ordered
 
-        ordered = order_quad_points(pts)
-        tl, tr, br, bl = ordered
+    width_a = float(np.linalg.norm(br - bl))
+    width_b = float(np.linalg.norm(tr - tl))
+    max_w = int(round(max(width_a, width_b)))
 
-        width_a = np.linalg.norm(br - bl)
-        width_b = np.linalg.norm(tr - tl)
-        max_w = int(max(width_a, width_b))
+    height_a = float(np.linalg.norm(tr - br))
+    height_b = float(np.linalg.norm(tl - bl))
+    max_h = int(round(max(height_a, height_b)))
 
-        height_a = np.linalg.norm(tr - br)
-        height_b = np.linalg.norm(tl - bl)
-        max_h = int(max(height_a, height_b))
+    if max_w > 100 and max_h > 100:
+        dst = np.array([
+            [0, 0],
+            [max_w - 1, 0],
+            [max_w - 1, max_h - 1],
+            [0, max_h - 1]
+        ], dtype="float32")
 
-        if max_w > 100 and max_h > 100:
-            dst = np.array([
-                [0, 0],
-                [max_w - 1, 0],
-                [max_w - 1, max_h - 1],
-                [0, max_h - 1]
-            ], dtype="float32")
-
-            M = cv2.getPerspectiveTransform(ordered, dst)
-            rectified = cv2.warpPerspective(gray_img, M, (max_w, max_h), flags=cv2.INTER_LINEAR)
-            return rectified
+        M = cv2.getPerspectiveTransform(ordered, dst)
+        rectified = cv2.warpPerspective(
+            gray_img,
+            M,
+            (max_w, max_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=int(np.min(gray_img))
+        )
+        return rectified
 
     return gray_img
 
 
-def detect_grid_topology(rectified_img: np.ndarray) -> Tuple[int, int, List[int], List[int]]:
+# -----------------------------------------------------------------------------
+# 2. Adaptive Projection-Profile Grid Segmentation & Geometric Fallback
+# -----------------------------------------------------------------------------
+def _geometric_grid_fallback(
+    active_h: int,
+    active_w: int,
+    y_start: int,
+    y_end: int,
+    x_start: int,
+    x_end: int
+) -> Tuple[int, int, List[int], List[int]]:
     """
-    Computes horizontal and vertical gradient projection profiles to dynamically
-    detect rows (R) and columns (C), along with precise pixel divider boundaries.
+    Deterministic geometric fallback based on classical photovoltaic module
+    aspect ratios when extreme noise or severe corruption prevents automatic
+    projection profile peak resolution.
+    """
+    aspect_ratio = float(active_w) / float(max(1, active_h))
+
+    if aspect_ratio >= 1.0:
+        # Landscape orientation
+        if aspect_ratio >= 2.35:
+            rows, cols = 6, 20  # 120 half-cut landscape
+        elif aspect_ratio >= 1.82:
+            rows, cols = 6, 12  # 72 full-cell commercial
+        else:
+            rows, cols = 6, 10  # 60 full-cell standard
+    else:
+        # Portrait orientation
+        inv_ar = 1.0 / max(aspect_ratio, 1e-6)
+        if inv_ar >= 2.35:
+            rows, cols = 20, 6
+        elif inv_ar >= 1.82:
+            rows, cols = 12, 6
+        else:
+            rows, cols = 10, 6
+
+    logger.warning(
+        "Applying geometric aspect-ratio fallback for grid segmentation "
+        "(active_w=%d, active_h=%d, AR=%.2f -> fallback=%dx%d).",
+        active_w, active_h, aspect_ratio, rows, cols
+    )
+
+    y_bounds = [int(round(y)) for y in np.linspace(y_start, y_end + 1, rows + 1)]
+    x_bounds = [int(round(x)) for x in np.linspace(x_start, x_end + 1, cols + 1)]
+    return rows, cols, y_bounds, x_bounds
+
+
+def _detect_1d_dividers(
+    active_sub: np.ndarray,
+    axis: int,
+    min_cells: int = 4,
+    max_cells: int = 26
+) -> Tuple[List[int], List[Tuple[int, int]]]:
+    """
+    Detects cell dividers along a given axis (axis=1 for rows along Y, axis=0 for cols along X)
+    using a hybrid of:
+    - High-percentile & mean intensity projection valleys (resistant to dead cells),
+    - Directional Sobel edge energy,
+    - Continuous dark-trough coalescing (prevents splitting wide Half-Cut central junction
+      gaps into double Sobel peaks), and
+    - Harmonic pitch interpolation (recovers missing dividers between adjacent dead cells).
+
+    Returns:
+      (dividers, gap_spans) where dividers are relative coordinates in [0, L]
+      and gap_spans are (gap_start, gap_end) intervals for each divider.
+    """
+    length = active_sub.shape[0] if axis == 1 else active_sub.shape[1]
+    if length < 32:
+        return [], []
+
+    # 1. Projection profiles along perpendicular axis
+    mean_prof = np.mean(active_sub, axis=axis).astype(np.float32)
+    p80_prof = np.percentile(active_sub, 80, axis=axis).astype(np.float32)
+    # Blending p80 with mean ensures inter-cell gaps stay dark while rows/cols
+    # containing several dead cells remain bright in the profile
+    intensity_prof = 0.50 * mean_prof + 0.50 * p80_prof
+
+    sigma = max(2.0, length * 0.003)
+    if axis == 1:
+        sobel = np.abs(cv2.Sobel(active_sub, cv2.CV_32F, 0, 1, ksize=3))
+    else:
+        sobel = np.abs(cv2.Sobel(active_sub, cv2.CV_32F, 1, 0, ksize=3))
+
+    grad_prof = gaussian_filter1d(np.mean(sobel, axis=axis), sigma=sigma)
+    valley_prof = gaussian_filter1d(np.max(intensity_prof) - intensity_prof, sigma=sigma)
+    valley_p80 = gaussian_filter1d(np.max(p80_prof) - p80_prof, sigma=sigma)
+
+    # Check if the 1D projection profile has sufficient valley contrast (SNR) above random noise
+    if float(np.ptp(valley_p80)) < 10.0 and float(np.ptp(valley_prof)) < 10.0:
+        return [], []
+
+    norm_g = (grad_prof - np.min(grad_prof)) / (np.ptp(grad_prof) + 1e-6)
+    norm_v = (valley_prof - np.min(valley_prof)) / (np.ptp(valley_prof) + 1e-6)
+    norm_vp80 = (valley_p80 - np.min(valley_p80)) / (np.ptp(valley_p80) + 1e-6)
+
+    combined = 0.45 * norm_g + 0.55 * norm_v
+
+    default_max_cells = 26 if axis == 1 else 17
+    min_dist = max(20 if axis == 1 else 35, length // default_max_cells)
+    peaks, _ = find_peaks(combined, distance=min_dist, prominence=0.08)
+    margin = int(length * 0.035)
+    # Require that any valid divider is a genuine dark valley in the P80 profile
+    # (rejects thin internal cell fingers and single-cell half-dark grid faults)
+    raw_divs = [
+        int(p) for p in peaks
+        if margin < p < (length - margin) and norm_vp80[p] >= 0.22
+    ]
+
+    if not raw_divs:
+        return [], []
+
+    # 2. Coalesce double-peaks caused by wide Half-Cut central junction gaps
+    # If two adjacent candidate dividers bound a continuous dark trough (no bright cell body
+    # between them), merge them into a single wide-gap divider
+    dark_thresh = float(np.min(p80_prof) + 0.40 * np.ptp(p80_prof))
+    coalesced_divs: List[int] = []
+    coalesced_spans: List[Tuple[int, int]] = []
+
+    i = 0
+    while i < len(raw_divs):
+        d_curr = raw_divs[i]
+        # Measure local dark trough span around d_curr
+        g_left = d_curr
+        while g_left > 0 and p80_prof[g_left - 1] <= dark_thresh:
+            g_left -= 1
+        g_right = d_curr
+        while g_right < length - 1 and p80_prof[g_right + 1] <= dark_thresh:
+            g_right += 1
+
+        if i + 1 < len(raw_divs):
+            d_next = raw_divs[i + 1]
+            span_between = p80_prof[d_curr:d_next + 1]
+            # Check if the region between d_curr and d_next is continuously dark (a single wide gap)
+            if len(span_between) > 0 and float(np.median(span_between)) <= dark_thresh * 1.15:
+                merged_center = int(round(0.5 * (d_curr + d_next)))
+                g_right_next = d_next
+                while g_right_next < length - 1 and p80_prof[g_right_next + 1] <= dark_thresh:
+                    g_right_next += 1
+                coalesced_divs.append(merged_center)
+                coalesced_spans.append((min(g_left, d_curr), max(g_right_next, d_next)))
+                i += 2
+                continue
+
+        coalesced_divs.append(d_curr)
+        coalesced_spans.append((g_left, g_right))
+        i += 1
+
+    # 3. Harmonic Pitch Regularization: interpolate missing dividers if adjacent dead cells
+    # suppressed a valley, or remove spurious internal finger peaks
+    if len(coalesced_divs) >= 2:
+        pts_all = [0] + coalesced_divs + [length]
+        diffs = np.diff(pts_all).astype(np.float32)
+        median_pitch = float(np.median(diffs))
+
+        if median_pitch > min_dist:
+            refined_divs: List[int] = []
+            refined_spans: List[Tuple[int, int]] = []
+            prev_pos = 0
+            for d_pos, d_span in zip(coalesced_divs, coalesced_spans):
+                step = d_pos - prev_pos
+                # If a gap is ~2x or ~3x the median cell pitch, interpolate the missing divider(s)
+                n_missing = int(round(step / median_pitch)) - 1
+                if 1 <= n_missing <= 2 and abs(step - (n_missing + 1) * median_pitch) <= 0.28 * median_pitch:
+                    for m_idx in range(1, n_missing + 1):
+                        interp_d = int(round(prev_pos + m_idx * (step / float(n_missing + 1))))
+                        refined_divs.append(interp_d)
+                        refined_spans.append((max(0, interp_d - 2), min(length - 1, interp_d + 2)))
+                refined_divs.append(d_pos)
+                refined_spans.append(d_span)
+                prev_pos = d_pos
+
+            # Also check trailing interval from last divider to `length`
+            tail_step = length - prev_pos
+            n_tail_missing = int(round(tail_step / median_pitch)) - 1
+            if 1 <= n_tail_missing <= 2 and abs(tail_step - (n_tail_missing + 1) * median_pitch) <= 0.28 * median_pitch:
+                for m_idx in range(1, n_tail_missing + 1):
+                    interp_d = int(round(prev_pos + m_idx * (tail_step / float(n_tail_missing + 1))))
+                    refined_divs.append(interp_d)
+                    refined_spans.append((max(0, interp_d - 2), min(length - 1, interp_d + 2)))
+
+            coalesced_divs = refined_divs
+            coalesced_spans = refined_spans
+
+    return coalesced_divs, coalesced_spans
+
+
+def _locate_active_area(rectified_img: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Identifies the active cell matrix bounding region [y_start, y_end, x_start, x_end]
+    using high-percentile (P88) + mean intensity projections so that border rows/columns
+    with up to 85% dead/dark cells are still accurately included.
     """
     h, w = rectified_img.shape[:2]
 
-    # 1. Identify the active luminescent area of the photovoltaic module
-    proj_y = np.mean(rectified_img, axis=1)
-    th_y = (np.max(proj_y) + np.min(proj_y)) * 0.35
-    act_y = np.where(proj_y > th_y)[0]
+    # Blend 88th percentile with mean: immune to up to 85% dead cells in a border row/col
+    # while rejecting localized small reflection specks on the outer frame
+    proj_y_mean = np.mean(rectified_img, axis=1)
+    proj_y_p88 = np.percentile(rectified_img, 88, axis=1)
+    prof_y = 0.40 * proj_y_mean + 0.60 * proj_y_p88
+    th_y = (np.max(prof_y) + np.min(prof_y)) * 0.35
+    act_y = np.where(prof_y > th_y)[0]
     y_start, y_end = (int(act_y[0]), int(act_y[-1])) if len(act_y) else (0, h - 1)
 
-    proj_x = np.mean(rectified_img, axis=0)
-    th_x = (np.max(proj_x) + np.min(proj_x)) * 0.35
-    act_x = np.where(proj_x > th_x)[0]
+    proj_x_mean = np.mean(rectified_img, axis=0)
+    proj_x_p88 = np.percentile(rectified_img, 88, axis=0)
+    prof_x = 0.40 * proj_x_mean + 0.60 * proj_x_p88
+    th_x = (np.max(prof_x) + np.min(prof_x)) * 0.35
+    act_x = np.where(prof_x > th_x)[0]
     x_start, x_end = (int(act_x[0]), int(act_x[-1])) if len(act_x) else (0, w - 1)
 
+    return y_start, y_end, x_start, x_end
+
+
+def _recover_dark_border_bands(
+    bounds: List[int],
+    full_length: int
+) -> List[int]:
+    """
+    Checks margin symmetry of the detected grid bounds `[b_0, b_1, ..., b_k]` inside
+    `[0, full_length]`. If an entire border row or column of cells is 100% dead/dark,
+    one margin (`b_0` or `full_length - b_k`) will be larger than the opposite frame
+    margin by an integer multiple of the median cell pitch `T`.
+    Prepends or appends the missing dark border row/col bounds automatically.
+    """
+    if len(bounds) < 3:
+        return bounds
+
+    pitches = np.diff(bounds).astype(np.float32)
+    median_pitch = float(np.median(pitches))
+    if median_pitch < 15.0:
+        return bounds
+
+    start_margin = bounds[0]
+    end_margin = full_length - bounds[-1]
+    updated = list(bounds)
+
+    # Check if start_margin hides 1 or 2 completely dark border rows/cols compared to end_margin
+    if start_margin - end_margin >= 0.78 * median_pitch:
+        n_extra = int(round((start_margin - end_margin) / median_pitch))
+        if 1 <= n_extra <= 2:
+            for _ in range(n_extra):
+                new_b0 = max(end_margin, int(round(updated[0] - median_pitch)))
+                if updated[0] - new_b0 >= 0.70 * median_pitch:
+                    updated.insert(0, new_b0)
+
+    # Symmetrically check if end_margin hides 1 or 2 completely dark border rows/cols
+    if end_margin - start_margin >= 0.78 * median_pitch:
+        n_extra = int(round((end_margin - start_margin) / median_pitch))
+        if 1 <= n_extra <= 2:
+            for _ in range(n_extra):
+                new_end = min(full_length - start_margin, int(round(updated[-1] + median_pitch)))
+                if new_end - updated[-1] >= 0.70 * median_pitch:
+                    updated.append(new_end)
+
+    return updated
+
+
+def detect_grid_topology(rectified_img: np.ndarray) -> Tuple[int, int, List[int], List[int]]:
+    """
+    Computes horizontal and vertical projection profiles to dynamically detect
+    rows (R) and columns (C), along with precise pixel divider boundaries.
+    Supports both Full-Cell (e.g. 6x10, 6x12) and Half-Cut / Split-Cell (e.g. 12x10, 12x12)
+    modules, recovers dark peripheral rows/columns, validates cell count plausibility,
+    and falls back to aspect-ratio geometry under extreme noise.
+    """
+    if rectified_img is None or rectified_img.size == 0:
+        raise ValueError("Cannot detect grid topology on an empty image.")
+
+    if len(rectified_img.shape) == 3:
+        rectified_img = cv2.cvtColor(rectified_img, cv2.COLOR_BGR2GRAY)
+
+    h, w = rectified_img.shape[:2]
+
+    # 1. Identify active luminescent matrix area (resilient to dark border cells)
+    y_start, y_end, x_start, x_end = _locate_active_area(rectified_img)
     active_sub = rectified_img[y_start:y_end + 1, x_start:x_end + 1]
     ah, aw = active_sub.shape[:2]
 
-    # 2. Row Divider Detection along Y
-    sobel_y = np.abs(cv2.Sobel(active_sub, cv2.CV_32F, 0, 1, ksize=3))
-    gy = gaussian_filter1d(np.mean(sobel_y, axis=1), sigma=max(2.0, ah * 0.003))
-    iy = gaussian_filter1d(np.max(active_sub) - np.mean(active_sub, axis=1), sigma=max(2.0, ah * 0.003))
-    norm_gy = (gy - np.min(gy)) / (np.ptp(gy) + 1e-6)
-    norm_iy = (iy - np.min(iy)) / (np.ptp(iy) + 1e-6)
-    cy = 0.5 * norm_gy + 0.5 * norm_iy
+    if ah < 32 or aw < 32:
+        return _geometric_grid_fallback(h, w, 0, h - 1, 0, w - 1)
 
-    # Solar modules have between 4 and 26 rows -> cell height >= ah / 26
-    dist_y = max(20, ah // 26)
-    peaks_y, _ = find_peaks(cy, distance=dist_y, prominence=0.08)
-    margin_y = int(ah * 0.035)
-    row_divs = [int(p) for p in peaks_y if margin_y < p < (ah - margin_y)]
+    # 2. Dynamic 1D projection valley & edge detection along Y (rows) and X (cols)
+    row_divs, _ = _detect_1d_dividers(active_sub, axis=1, min_cells=4, max_cells=26)
+    col_divs, _ = _detect_1d_dividers(active_sub, axis=0, min_cells=4, max_cells=26)
 
-    # 3. Column Divider Detection along X
-    sobel_x = np.abs(cv2.Sobel(active_sub, cv2.CV_32F, 1, 0, ksize=3))
-    gx = gaussian_filter1d(np.mean(sobel_x, axis=0), sigma=max(2.0, aw * 0.003))
-    ix = gaussian_filter1d(np.max(active_sub) - np.mean(active_sub, axis=0), sigma=max(2.0, aw * 0.003))
-    norm_gx = (gx - np.min(gx)) / (np.ptp(gx) + 1e-6)
-    norm_ix = (ix - np.min(ix)) / (np.ptp(ix) + 1e-6)
-    cx = 0.5 * norm_gx + 0.5 * norm_ix
-
-    # Solar modules have between 4 and 16 columns -> cell width >= aw / 17
-    dist_x = max(35, aw // 17)
-    peaks_x, _ = find_peaks(cx, distance=dist_x, prominence=0.08)
-    margin_x = int(aw * 0.035)
-    col_divs = [int(p) for p in peaks_x if margin_x < p < (aw - margin_x)]
-
-    rows = len(row_divs) + 1
-    cols = len(col_divs) + 1
-
-    # Map back to full rectified coordinates
     y_bounds = [y_start] + [y_start + d for d in row_divs] + [y_end + 1]
     x_bounds = [x_start] + [x_start + d for d in col_divs] + [x_end + 1]
 
+    # 3. Recover 100%-dead border rows or columns via frame-margin symmetry
+    y_bounds = _recover_dark_border_bands(y_bounds, h)
+    x_bounds = _recover_dark_border_bands(x_bounds, w)
+
+    rows = len(y_bounds) - 1
+    cols = len(x_bounds) - 1
+
+    # 4. Integrity & Plausibility Validation + Geometric Fallback on Severe Noise
+    mean_cell_h = float(y_bounds[-1] - y_bounds[0]) / max(1, rows)
+    mean_cell_w = float(x_bounds[-1] - x_bounds[0]) / max(1, cols)
+    cell_ar = mean_cell_w / max(1.0, mean_cell_h)
+
+    # Trigger geometric fallback if grid resolution failed or produced impossible cell aspect ratio
+    if (
+        rows < 4
+        or cols < 4
+        or rows > 26
+        or cols > 26
+        or cell_ar < 0.25
+        or cell_ar > 4.0
+    ):
+        return _geometric_grid_fallback(ah, aw, y_start, y_end, x_start, x_end)
+
+    total_cells = rows * cols
+    if total_cells not in PLAUSIBLE_CELL_COUNTS:
+        logger.warning(
+            "Grid plausibility warning: detected %dx%d (%d cells), which is outside "
+            "standard commercial PV families (60, 72, 120, 144).",
+            rows, cols, total_cells
+        )
+
     return rows, cols, y_bounds, x_bounds
+
+
+def segment_panel_cells(
+    rectified_img: np.ndarray,
+    y_bounds: Optional[List[int]] = None,
+    x_bounds: Optional[List[int]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Dynamically slices the rectified photovoltaic module image into individual cells
+    using projection-profile divider bounds (handling wide Half-Cut central busbar gaps
+    by trimming excess dark gap margins) and returns spatial traceability metadata:
+
+        {
+            "cell_id": int,
+            "row": int,
+            "col": int,
+            "bbox": [x, y, w, h],
+            "image": np.ndarray (uint8)
+        }
+    """
+    if rectified_img is None or rectified_img.size == 0:
+        raise ValueError("Cannot segment cells from an empty image.")
+
+    if len(rectified_img.shape) == 3:
+        rectified_img = cv2.cvtColor(rectified_img, cv2.COLOR_BGR2GRAY)
+
+    if y_bounds is None or x_bounds is None:
+        _, _, y_bounds, x_bounds = detect_grid_topology(rectified_img)
+
+    rows = len(y_bounds) - 1
+    cols = len(x_bounds) - 1
+
+    # Detect if there is a wide central half-cut gap along Y or X so we can trim
+    # the extra dark junction-box strip from adjacent cell crops
+    y_trim_top = [0] * rows
+    y_trim_bot = [0] * rows
+    if rows >= 6 and rows % 2 == 0:
+        mid_r = rows // 2
+        center_div_y = y_bounds[mid_r]
+        band_y0 = max(0, center_div_y - 25)
+        band_y1 = min(rectified_img.shape[0], center_div_y + 25)
+        prof_y = np.mean(rectified_img[band_y0:band_y1, x_bounds[0]:x_bounds[-1]], axis=1)
+        if prof_y.size > 0:
+            dark_th = float(np.min(prof_y) + 0.35 * np.ptp(prof_y))
+            dark_idx = np.where(prof_y <= dark_th)[0]
+            if len(dark_idx) >= 10:
+                # Wide central half-cut gap detected
+                half_gap = max(0, (int(dark_idx[-1] - dark_idx[0]) - 4) // 2)
+                cell_h_above = y_bounds[mid_r] - y_bounds[mid_r - 1]
+                cell_h_below = y_bounds[mid_r + 1] - y_bounds[mid_r]
+                y_trim_bot[mid_r - 1] = min(half_gap, int(cell_h_above * 0.22))
+                y_trim_top[mid_r] = min(half_gap, int(cell_h_below * 0.22))
+
+    segmented_cells: List[Dict[str, Any]] = []
+    for r in range(rows):
+        y0 = int(y_bounds[r] + y_trim_top[r])
+        y1 = int(y_bounds[r + 1] - y_trim_bot[r])
+        if y1 <= y0:
+            y0, y1 = int(y_bounds[r]), int(y_bounds[r + 1])
+
+        for c in range(cols):
+            x0 = int(x_bounds[c])
+            x1 = int(x_bounds[c + 1])
+            cell_id = r * cols + c
+            w = int(x1 - x0)
+            h = int(y1 - y0)
+            cell_crop = np.ascontiguousarray(rectified_img[y0:y1, x0:x1], dtype=np.uint8)
+
+            segmented_cells.append({
+                "cell_id": cell_id,
+                "row": r,
+                "col": c,
+                "bbox": [x0, y0, w, h],
+                "image": cell_crop,
+            })
+
+    return segmented_cells
+
+
+def preprocess_el_module(image_input: Union[bytes, np.ndarray]) -> Dict[str, Any]:
+    """
+    End-to-end modular preprocessing pipeline for electroluminescence (EL) PV panels:
+    1. Decodes or validates grayscale uint8 raster.
+    2. Applies CLAHE local contrast normalization & perspective homography rectification.
+    3. Dynamically segments the cell grid (Full-cell or Half-cut) with fallback safety.
+    4. Returns rectified raster, topology metadata, and spatially indexed cell crops.
+    """
+    if isinstance(image_input, (bytes, bytearray)):
+        if len(image_input) < 32:
+            raise ValueError("Empty or corrupted image byte stream.")
+        np_buffer = np.frombuffer(image_input, dtype=np.uint8)
+        gray_img = cv2.imdecode(np_buffer, cv2.IMREAD_GRAYSCALE)
+        if gray_img is None or gray_img.size == 0:
+            raise ValueError("OpenCV failed to decode image byte stream.")
+    elif isinstance(image_input, np.ndarray):
+        if image_input.size == 0:
+            raise ValueError("Empty numpy array provided to preprocess_el_module.")
+        gray_img = (
+            cv2.cvtColor(image_input, cv2.COLOR_BGR2GRAY)
+            if len(image_input.shape) == 3
+            else image_input.copy()
+        )
+        if gray_img.dtype != np.uint8:
+            gray_img = np.clip(gray_img, 0, 255).astype(np.uint8)
+    else:
+        raise TypeError("image_input must be bytes or numpy.ndarray.")
+
+    rectified = normalize_perspective(gray_img)
+    rows, cols, y_bounds, x_bounds = detect_grid_topology(rectified)
+    cells = segment_panel_cells(rectified, y_bounds=y_bounds, x_bounds=x_bounds)
+    total_cells = rows * cols
+
+    mean_cell_h = float(y_bounds[-1] - y_bounds[0]) / max(1, rows)
+    mean_cell_w = float(x_bounds[-1] - x_bounds[0]) / max(1, cols)
+    cell_aspect = mean_cell_w / max(1.0, mean_cell_h)
+    is_half_cut = (
+        total_cells >= 108
+        or rows >= 12
+        or cols >= 20
+        or cell_aspect >= 1.45
+        or cell_aspect <= 0.68
+    )
+
+    return {
+        "rectified_image": rectified,
+        "rows": rows,
+        "cols": cols,
+        "total_cells": total_cells,
+        "panel_type": "half-cut" if is_half_cut else "full-cell",
+        "is_plausible_topology": total_cells in PLAUSIBLE_CELL_COUNTS,
+        "x_bounds": x_bounds,
+        "y_bounds": y_bounds,
+        "cells": cells,
+    }
 
 
 def inspect_cell_region(
@@ -398,8 +1141,10 @@ def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
 
 def _format_cell_crop_bgr(cell_crop: np.ndarray) -> np.ndarray:
     """
-    Garante que o crop da célula possua 3 canais (BGR) para entrada no YOLOv8-cls.
+    Garante que o crop da célula possua 3 canais (BGR) e tipo uint8 para entrada no YOLOv8-cls.
     """
+    if cell_crop.dtype != np.uint8:
+        cell_crop = np.clip(cell_crop, 0, 255).astype(np.uint8)
     if len(cell_crop.shape) == 2:
         return cv2.cvtColor(cell_crop, cv2.COLOR_GRAY2BGR)
     if cell_crop.shape[2] == 4:
@@ -564,9 +1309,9 @@ def evaluate_module(
     """
     Complete end-to-end computer vision processing pipeline for a single PV module:
     1. Memory decoding & validation
-    2. Perspective normalization (homography rectification)
-    3. Dynamic grid topology detection (arbitrary R rows x C cols)
-    4. In-memory cell slicing (R*C sub-arrays)
+    2. Perspective normalization (CLAHE + Convex Hull 4-Line Homography Rectification)
+    3. Dynamic grid topology detection (arbitrary R rows x C cols, Full-Cell & Half-Cut)
+    4. Adaptive in-memory cell slicing with spatial traceability metadata
     5. Vectorized batch YOLOv8-cls classification per cell (best.pt)
     6. Module damage % computation and FAIL/PASS classification
     7. Visual reconstruction with defect bounding boxes
@@ -604,11 +1349,18 @@ def evaluate_module(
         "height_pct": round(((y_end - y_start) / float(h)) * 100.0, 2)
     }
 
-    # Baseline statistics for fallback heuristic
-    module_median_int = float(np.median(rectified))
-    module_std_int = float(np.std(rectified))
+    # Baseline statistics across active cells for fallback heuristic
+    active_crop = rectified[y_start:y_end, x_start:x_end]
+    if active_crop.size > 0:
+        # Use upper-half luminescence to avoid bias when many border cells are dead
+        bright_pixels = active_crop[active_crop > np.percentile(active_crop, 35)]
+        module_median_int = float(np.median(bright_pixels)) if bright_pixels.size > 0 else float(np.median(rectified))
+        module_std_int = float(np.std(active_crop))
+    else:
+        module_median_int = float(np.median(rectified))
+        module_std_int = float(np.std(rectified))
 
-    # 3. In-Memory Cell Slicing and Batch YOLOv8-cls Inspection
+    # 3. Adaptive Cell Slicing and Batch YOLOv8-cls Inspection
     cells: List[CellInspection] = []
     defective_count = 0
     yolo_model: Optional[YOLO] = model
@@ -622,35 +1374,31 @@ def evaluate_module(
             )
             yolo_model = None
 
-    cell_slices: List[Tuple[int, int, int, int, int, int, np.ndarray]] = []
-    for r in range(rows):
-        y0, y1 = y_bounds[r], y_bounds[r + 1]
-        for c in range(cols):
-            x0, x1 = x_bounds[c], x_bounds[c + 1]
-            idx = r * cols + c
-            cell_img = rectified[y0:y1, x0:x1]
-            cell_slices.append((idx, r, c, x0, y0, x1, y1, cell_img))
+    segmented_cells = segment_panel_cells(rectified, y_bounds=y_bounds, x_bounds=x_bounds)
 
-    if yolo_model is not None and cell_slices:
+    if yolo_model is not None and segmented_cells:
         batch_preds = classify_cells_batch_yolo(
-            [item[7] for item in cell_slices],
+            [item["image"] for item in segmented_cells],
             model=yolo_model
         )
     else:
         batch_preds = [
-            inspect_cell_region(item[7], module_median_int, module_std_int)
-            for item in cell_slices
+            inspect_cell_region(item["image"], module_median_int, module_std_int)
+            for item in segmented_cells
         ]
 
-    for (idx, r, c, x0, y0, x1, y1, _), (is_defective, defect_type, confidence) in zip(cell_slices, batch_preds):
+    for cell_meta, (is_defective, defect_type, confidence) in zip(segmented_cells, batch_preds):
         if is_defective:
             defective_count += 1
 
-        cell_w = int(x1 - x0)
-        cell_h = int(y1 - y0)
+        idx = int(cell_meta["cell_id"])
+        r = int(cell_meta["row"])
+        c = int(cell_meta["col"])
+        x0, y0, cell_w, cell_h = [int(v) for v in cell_meta["bbox"]]
+
         bbox = CellBoundingBox(
-            x=int(x0),
-            y=int(y0),
+            x=x0,
+            y=y0,
             width=cell_w,
             height=cell_h,
             x_pct=round((x0 / float(w)) * 100.0, 3),
