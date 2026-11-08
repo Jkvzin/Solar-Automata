@@ -18,6 +18,13 @@
     <span class="env">CONSOLE EL <b>·</b> QA ÓPTICO</span>
   </div>
   <span class="spacer"></span>
+  <div class="auth-bar" id="authBar" data-od-id="auth-bar">
+    <span class="tag-replica" id="authUserBadge" title="Status de autenticação da sessão">SESSÃO: NÃO AUTENTICADO</span>
+    <button class="btn" id="authOpenBtn" type="button" data-od-id="cta-auth">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>
+      <span id="authBtnLabel">Autenticar</span>
+    </button>
+  </div>
   <button class="btn btn-primary" id="ingestBtn" type="button" data-od-id="cta-ingest">
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
     Ingerir lote
@@ -272,6 +279,66 @@
 <input type="file" id="fileInput" multiple accept=".png,.jpg,.jpeg,.tif,.tiff,.json,image/*" class="sr-only" />
 <div id="tt" class="tooltip" role="tooltip"></div>
 <div id="live" class="sr-only" role="status" aria-live="polite"></div>
+
+<!-- Modal de Autenticação e Cadastro de Operadores (LuminaPV Identity) -->
+<div class="auth-backdrop" id="authModalBackdrop" hidden>
+  <div class="auth-modal" id="authModal" role="dialog" aria-modal="true" aria-labelledby="authModalTitle" aria-describedby="authModalDesc">
+    <div class="auth-head">
+      <span class="sec-label" id="authModalTitle">Controle de Acesso · Operador LuminaPV</span>
+      <span class="spacer"></span>
+      <button class="btn btn-icon" id="authCloseBtn" type="button" aria-label="Fechar janela de autenticação" title="Fechar (ESC)">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="auth-tabs" role="tablist" aria-label="Modo de autenticação">
+      <button type="button" role="tab" id="authTabLogin" data-auth-mode="login" aria-selected="true">ENTRAR NA SESSÃO</button>
+      <button type="button" role="tab" id="authTabRegister" data-auth-mode="register" aria-selected="false">CADASTRAR OPERADOR</button>
+    </div>
+    <form class="auth-form" id="authForm" novalidate>
+      <p class="auth-desc" id="authModalDesc">Autentique-se com sua credencial operacional para assinar lotes de inspeção EL e rastrear auditoria no cluster.</p>
+      <div class="auth-alert" id="authAlert" role="alert" hidden></div>
+
+      <div class="auth-field" id="authNameField" hidden>
+        <label for="authName" class="sec-label">Nome completo do operador</label>
+        <input type="text" id="authName" name="name" class="auth-input" placeholder="Ex.: Gustavo Grouwber" autocomplete="name" minlength="2" maxlength="120" />
+      </div>
+
+      <div class="auth-field">
+        <label for="authEmail" class="sec-label">E-mail operacional</label>
+        <input type="email" id="authEmail" name="email" class="auth-input mono" placeholder="operador@luminapv.local" autocomplete="email" required />
+      </div>
+
+      <div class="auth-field">
+        <label for="authPassword" class="sec-label">Senha de acesso (mín. 8 caracteres)</label>
+        <input type="password" id="authPassword" name="password" class="auth-input mono" placeholder="••••••••••••" autocomplete="current-password" minlength="8" required />
+      </div>
+
+      <div class="auth-field" id="authConfirmField" hidden>
+        <label for="authPasswordConfirm" class="sec-label">Confirmar senha</label>
+        <input type="password" id="authPasswordConfirm" name="passwordConfirm" class="auth-input mono" placeholder="••••••••••••" autocomplete="new-password" minlength="8" />
+      </div>
+
+      <div class="auth-field" id="authRoleField" hidden>
+        <label for="authRole" class="sec-label">Perfil de acesso (RBAC)</label>
+        <select id="authRole" name="role" class="auth-input mono">
+          <option value="operator">OPERATOR · Operador de Linha EL</option>
+          <option value="admin">ADMIN · Engenheiro Chefe / Supervisor</option>
+          <option value="viewer">VIEWER · Auditor de Qualidade (Somente Leitura)</option>
+        </select>
+      </div>
+
+      <div class="auth-demo-row" id="authDemoRow">
+        <span class="mono" style="font-size:10px;color:var(--muted2)">Credencial local padrão:</span>
+        <button type="button" class="linkbtn mono" id="authDemoFillBtn" style="font-size:10.5px">operador@luminapv.local</button>
+      </div>
+
+      <div class="auth-actions">
+        <button type="button" class="btn" id="authCancelBtn">Cancelar</button>
+        <button type="submit" class="btn btn-primary" id="authSubmitBtn">Entrar no Console</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <!-- Payload de exemplo de fallback (usado quando o fetch externo falha) -->
 <script type="application/json" id="samplePayload">

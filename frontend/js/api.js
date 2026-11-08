@@ -147,7 +147,16 @@ function postBulk(files) {
 
   function doFetch(useBody, useHeaders) {
     var opts = { method: "POST", signal: ctrl.signal };
-    if (useHeaders) opts.headers = useHeaders;
+    var mergedHeaders = {};
+    if (useHeaders) {
+      Object.keys(useHeaders).forEach(function(k) { mergedHeaders[k] = useHeaders[k]; });
+    }
+    if (state.auth && state.auth.token) {
+      mergedHeaders["Authorization"] = "Bearer " + state.auth.token;
+    }
+    if (Object.keys(mergedHeaders).length > 0) {
+      opts.headers = mergedHeaders;
+    }
     if (useBody !== fd) opts.duplex = "half";
     opts.body = useBody;
     return fetch(API_ENDPOINT, opts);
@@ -169,6 +178,9 @@ function postBulk(files) {
     $("#sbHttp").textContent = "HTTP " + status;
     return res.text().then(function(text) {
       if (!res.ok) {
+        if ((status === 401 || status === 403) && typeof openAuthModal === "function") {
+          openAuthModal("login", "Autenticação necessária para submeter lotes à análise.");
+        }
         var d = describeHttp(status, text && text.slice(0, 200));
         var err = new Error(d.title);
         err.title = d.title;
@@ -471,4 +483,170 @@ function stopClusterPolling() {
     clearInterval(state.clusterPollingInterval);
     state.clusterPollingInterval = null;
   }
+}
+
+/* ---------- authentication & session management (JWT + S3 Adapter) ---------- */
+function saveAuthSession(token, user) {
+  state.auth.token = token || null;
+  state.auth.user = user || null;
+  state.auth.authenticated = !!(token && user);
+  state.auth.error = null;
+  try {
+    if (token && user) {
+      localStorage.setItem("luminapv.auth.token", token);
+      localStorage.setItem("luminapv.auth.user", JSON.stringify(user));
+    }
+  } catch (e) {}
+  if (typeof renderAuthUI === "function") renderAuthUI();
+}
+
+function clearAuthSession() {
+  state.auth.token = null;
+  state.auth.user = null;
+  state.auth.authenticated = false;
+  state.auth.error = null;
+  try {
+    localStorage.removeItem("luminapv.auth.token");
+    localStorage.removeItem("luminapv.auth.user");
+  } catch (e) {}
+  if (typeof renderAuthUI === "function") renderAuthUI();
+}
+
+function authLogin(email, password) {
+  state.auth.loading = true;
+  state.auth.error = null;
+  if (typeof renderAuthUI === "function") renderAuthUI();
+
+  return fetch(AUTH_LOGIN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: email, password: password })
+  })
+    .then(function(res) {
+      return res.json().catch(function() { return {}; }).then(function(body) {
+        if (!res.ok) {
+          var errMsg = (body && body.detail) ? String(body.detail) : ("Falha na autenticação (HTTP " + res.status + ").");
+          throw new Error(errMsg);
+        }
+        return body;
+      });
+    })
+    .then(function(data) {
+      state.auth.loading = false;
+      saveAuthSession(data.access_token, data.user);
+      log("ok", "Operador autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "] · storage=" + (data.user.storage_backend || "memory"));
+      live("Sessão iniciada como " + data.user.name);
+      if (typeof closeAuthModal === "function") closeAuthModal();
+      return data;
+    })
+    .catch(function(err) {
+      state.auth.loading = false;
+      state.auth.error = (err && err.message) ? err.message : "Não foi possível comunicar com o servidor de autenticação.";
+      log("error", "Falha de login: " + state.auth.error);
+      if (typeof renderAuthUI === "function") renderAuthUI();
+      throw err;
+    });
+}
+
+function authRegister(name, email, password, role) {
+  state.auth.loading = true;
+  state.auth.error = null;
+  if (typeof renderAuthUI === "function") renderAuthUI();
+
+  return fetch(AUTH_REGISTER_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name,
+      email: email,
+      password: password,
+      role: role || "operator"
+    })
+  })
+    .then(function(res) {
+      return res.json().catch(function() { return {}; }).then(function(body) {
+        if (!res.ok) {
+          var errMsg = (body && body.detail) ? String(body.detail) : ("Falha no cadastro (HTTP " + res.status + ").");
+          throw new Error(errMsg);
+        }
+        return body;
+      });
+    })
+    .then(function(data) {
+      state.auth.loading = false;
+      saveAuthSession(data.access_token, data.user);
+      log("ok", "Novo operador cadastrado e autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "]");
+      live("Cadastro concluído. Sessão iniciada como " + data.user.name);
+      if (typeof closeAuthModal === "function") closeAuthModal();
+      return data;
+    })
+    .catch(function(err) {
+      state.auth.loading = false;
+      state.auth.error = (err && err.message) ? err.message : "Não foi possível concluir o cadastro.";
+      log("error", "Falha no cadastro de operador: " + state.auth.error);
+      if (typeof renderAuthUI === "function") renderAuthUI();
+      throw err;
+    });
+}
+
+function authLogout() {
+  var tok = state.auth.token;
+  var prevEmail = state.auth.user ? state.auth.user.email : "operador";
+  clearAuthSession();
+  log("info", "Sessão encerrada para " + prevEmail + " · token revogado");
+  live("Sessão encerrada.");
+
+  if (!tok) return Promise.resolve();
+  return fetch(AUTH_LOGOUT_ENDPOINT, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + tok }
+  }).catch(function() {
+    // Graceful cleanup even if backend is offline
+    return null;
+  });
+}
+
+function authVerifySession() {
+  var savedToken = null;
+  var savedUser = null;
+  try {
+    savedToken = localStorage.getItem("luminapv.auth.token");
+    var rawUser = localStorage.getItem("luminapv.auth.user");
+    if (rawUser) savedUser = JSON.parse(rawUser);
+  } catch (e) {}
+
+  if (!savedToken) {
+    clearAuthSession();
+    return Promise.resolve(null);
+  }
+
+  state.auth.token = savedToken;
+  state.auth.user = savedUser;
+  state.auth.authenticated = !!(savedToken && savedUser);
+  if (typeof renderAuthUI === "function") renderAuthUI();
+
+  return fetch(AUTH_ME_ENDPOINT, {
+    method: "GET",
+    headers: { "Authorization": "Bearer " + savedToken },
+    cache: "no-store"
+  })
+    .then(function(res) {
+      if (res.status === 401 || res.status === 403) {
+        clearAuthSession();
+        log("info", "Sessão anterior expirada ou revogada — faça login novamente.");
+        return null;
+      }
+      if (!res.ok) return savedUser;
+      return res.json();
+    })
+    .then(function(userDto) {
+      if (userDto && userDto.email) {
+        saveAuthSession(savedToken, userDto);
+      }
+      return userDto;
+    })
+    .catch(function() {
+      // Graceful degradation when running standalone HTML without backend
+      return savedUser;
+    });
 }

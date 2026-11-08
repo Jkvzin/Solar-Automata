@@ -1070,3 +1070,158 @@ canvas.dist {
   font-size: 10.5px;
   color: var(--muted2);
 }
+
+/* ---------- authentication bar & modal (LuminaPV Identity) ---------- */
+.auth-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 4px;
+  border-right: 1px solid var(--border-strong);
+}
+
+.tag-auth-ok {
+  background: rgba(137, 209, 133, 0.14);
+  border: 1px solid var(--pass);
+  color: var(--pass);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0 5px;
+  border-radius: 2px;
+  line-height: 15px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.auth-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(0, 0, 0, 0.68);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.auth-backdrop[hidden] {
+  display: none !important;
+}
+
+.auth-modal {
+  width: 100%;
+  max-width: 410px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  display: flex;
+  flex-direction: column;
+}
+
+.auth-head {
+  height: 32px;
+  padding: 0 10px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.auth-tabs button {
+  height: 28px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted2);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.auth-tabs button:last-child {
+  border-right: 0;
+}
+
+.auth-tabs button:hover {
+  background: var(--hover);
+  color: var(--fg-strong);
+}
+
+.auth-tabs button[aria-selected="true"] {
+  background: var(--surface);
+  color: var(--fg-strong);
+  border-bottom: 2px solid var(--accent);
+  font-weight: 600;
+}
+
+.auth-form {
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.auth-desc {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted2);
+  line-height: 1.45;
+}
+
+.auth-alert {
+  padding: 6px 8px;
+  background: var(--defect-bg);
+  border: 1px solid var(--defect);
+  color: var(--defect-ink);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.auth-input {
+  height: 28px;
+  padding: 0 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--fg-strong);
+  font-size: 12px;
+  border-radius: 2px;
+}
+
+.auth-input:focus {
+  outline: 1px solid var(--focus);
+  border-color: var(--focus);
+}
+
+.auth-demo-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.auth-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}

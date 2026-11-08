@@ -371,6 +371,11 @@ function initEvents() {
 
   document.addEventListener("keydown", function(e) {
     if (e.key === "Escape") {
+      var authBg = $("#authModalBackdrop");
+      if (authBg && !authBg.hidden) {
+        closeAuthModal();
+        return;
+      }
       var z = $(".zoomed");
       if (z) {
         z.classList.remove("zoomed");
@@ -381,6 +386,87 @@ function initEvents() {
       if (state.controller && state.loading) cancel();
     }
   });
+
+  var authOpenBtn = $("#authOpenBtn");
+  if (authOpenBtn) {
+    authOpenBtn.addEventListener("click", function() {
+      if (state.auth && state.auth.authenticated) {
+        authLogout();
+      } else {
+        openAuthModal("login");
+      }
+    });
+  }
+
+  var authCloseBtn = $("#authCloseBtn");
+  if (authCloseBtn) authCloseBtn.addEventListener("click", closeAuthModal);
+
+  var authCancelBtn = $("#authCancelBtn");
+  if (authCancelBtn) authCancelBtn.addEventListener("click", closeAuthModal);
+
+  var authModalBackdrop = $("#authModalBackdrop");
+  if (authModalBackdrop) {
+    authModalBackdrop.addEventListener("click", function(e) {
+      if (e.target === authModalBackdrop) closeAuthModal();
+    });
+  }
+
+  var authTabLogin = $("#authTabLogin");
+  if (authTabLogin) authTabLogin.addEventListener("click", function() { setAuthMode("login"); });
+
+  var authTabRegister = $("#authTabRegister");
+  if (authTabRegister) authTabRegister.addEventListener("click", function() { setAuthMode("register"); });
+
+  var authDemoFillBtn = $("#authDemoFillBtn");
+  if (authDemoFillBtn) {
+    authDemoFillBtn.addEventListener("click", function() {
+      var em = $("#authEmail"), pw = $("#authPassword");
+      if (em) em.value = "operador@luminapv.local";
+      if (pw) pw.value = "LuminaPV@2026";
+      state.auth.error = null;
+      renderAuthUI();
+    });
+  }
+
+  var authForm = $("#authForm");
+  if (authForm) {
+    authForm.addEventListener("submit", function(e) {
+      e.preventDefault();
+      var mode = (state.auth && state.auth.mode) || "login";
+      var email = ($("#authEmail") && $("#authEmail").value || "").trim();
+      var password = ($("#authPassword") && $("#authPassword").value || "");
+      var name = ($("#authName") && $("#authName").value || "").trim();
+      var confirmPw = ($("#authPasswordConfirm") && $("#authPasswordConfirm").value || "");
+      var role = ($("#authRole") && $("#authRole").value || "operator");
+
+      if (!email || email.indexOf("@") < 1) {
+        state.auth.error = "Informe um endereço de e-mail válido.";
+        renderAuthUI();
+        return;
+      }
+      if (!password || password.length < 8) {
+        state.auth.error = "A senha deve possuir pelo menos 8 caracteres.";
+        renderAuthUI();
+        return;
+      }
+
+      if (mode === "register") {
+        if (!name || name.length < 2) {
+          state.auth.error = "Informe o nome completo do operador (mín. 2 caracteres).";
+          renderAuthUI();
+          return;
+        }
+        if (password !== confirmPw) {
+          state.auth.error = "As senhas informadas não coincidem.";
+          renderAuthUI();
+          return;
+        }
+        authRegister(name, email, password, role).catch(function() {});
+      } else {
+        authLogin(email, password).catch(function() {});
+      }
+    });
+  }
 
   var themeBtn = $("#themeBtn");
   if (themeBtn) {
@@ -431,6 +517,7 @@ function boot() {
 
   log("info", "Console iniciado · endpoint " + API_ENDPOINT + " · nenhuma simulação no cliente");
   renderAll();
+  if (typeof authVerifySession === "function") authVerifySession();
   var sbH = $("#sbHttp");
   if (sbH) sbH.textContent = "HTTP —";
   setStatusBar("idle");
