@@ -783,7 +783,7 @@ function renderHistory() {
     if (a.authenticated && a.user && a.user.user_id) {
       prefixBadge.textContent = "s3://users/" + a.user.user_id + "/scans/*";
     } else {
-      prefixBadge.textContent = "s3://anonymous/scans/* (não autenticado)";
+      prefixBadge.textContent = "armazenamento local (não salvo no S3)";
     }
   }
 
@@ -794,10 +794,12 @@ function renderHistory() {
   if (!grid) return;
 
   if (!a.authenticated || !a.user) {
-    if (statusLabel) statusLabel.textContent = "Minhas análises · Sessão não autenticada";
+    var localCount = Array.isArray(state.modules) ? state.modules.length : 0;
+    if (statusLabel) statusLabel.textContent = "Minhas análises · Persistência Local (" + localCount + " no navegador)";
     grid.innerHTML = '<div class="empty-mini history-empty">' +
-      'Autentique-se na barra superior (<strong>Autenticar</strong>) para sincronizar suas imagens EL e relatórios JSON particionados por operador no Amazon S3 (<span class="mono">users/{user_id}/</span>).' +
-      '<div style="margin-top:8px"><button type="button" class="btn" id="historyAuthPromptBtn">Entrar na sessão de operador</button></div>' +
+      'Você não está logado. As imagens enviadas permanecem salvas apenas localmente neste navegador e <strong>não são enviadas ao Amazon S3</strong>.<br>' +
+      'Faça login ou crie uma conta para sincronizar automaticamente suas imagens e relatórios JSON processados no S3 (<span class="mono">users/{user_id}/</span>).' +
+      '<div style="margin-top:8px"><button type="button" class="btn" id="historyAuthPromptBtn">Entrar ou Criar Conta</button></div>' +
       '</div>';
     var promptBtn = $("#historyAuthPromptBtn");
     if (promptBtn) {
@@ -807,7 +809,7 @@ function renderHistory() {
   }
 
   if (statusLabel) {
-    statusLabel.textContent = "Minhas análises · Operador " + (a.user.name || a.user.email) + " (" + items.length + " registro" + (items.length === 1 ? "" : "s") + ")";
+    statusLabel.textContent = "Minhas análises no S3 · " + (a.user.name || a.user.email) + " (" + items.length + " registro" + (items.length === 1 ? "" : "s") + ")";
   }
 
   if (h.loading) {
@@ -822,8 +824,8 @@ function renderHistory() {
 
   if (!items.length) {
     grid.innerHTML = '<div class="empty-mini history-empty">' +
-      'Nenhuma inspeção persistida para <span class="mono">' + esc(a.user.email) + '</span>.<br>' +
-      'Ingira um lote de capturas EL para salvar automaticamente em <span class="mono">users/' + esc(a.user.user_id) + '/scans/</span>.' +
+      'Nenhuma inspeção persistida no S3 para <span class="mono">' + esc(a.user.email) + '</span>.<br>' +
+      'Ingira capturas EL para salvar automaticamente em <span class="mono">users/' + esc(a.user.user_id) + '/scans/</span>.' +
       '</div>';
     return;
   }
@@ -835,9 +837,8 @@ function renderHistory() {
     var badgeHtml = isFail
       ? '<span class="tag tag-fail">REPROVADO</span>'
       : '<span class="tag tag-pass">APROVADO</span>';
-    var thumbSrc = item.image_url || item.presigned_url || item.rectified_image || buildSyntheticThumbDataUri(item);
+    var thumbSrc = item.rectified_image || item.image_url || item.presigned_url || buildSyntheticThumbDataUri(item);
     var fallbackThumb = item.rectified_image || buildSyntheticThumbDataUri(item);
-    var presignedHref = item.image_url || item.presigned_url || "#";
     var s3Key = item.s3_image_key || ("users/" + a.user.user_id + "/scans/" + (item.filename || modId));
     var tsFormatted = formatHistoryTimestamp(item.timestamp);
 
@@ -886,34 +887,35 @@ function renderAuthUI() {
   var submitBtn = $("#authSubmitBtn");
   var nameField = $("#authNameField");
   var confirmField = $("#authConfirmField");
-  var roleField = $("#authRoleField");
-  var demoRow = $("#authDemoRow");
   var tabLogin = $("#authTabLogin");
   var tabReg = $("#authTabRegister");
+  var modalDesc = $("#authModalDesc");
 
   var isReg = a.mode === "register";
   if (tabLogin) tabLogin.setAttribute("aria-selected", isReg ? "false" : "true");
   if (tabReg) tabReg.setAttribute("aria-selected", isReg ? "true" : "false");
   if (nameField) nameField.hidden = !isReg;
   if (confirmField) confirmField.hidden = !isReg;
-  if (roleField) roleField.hidden = !isReg;
-  if (demoRow) demoRow.hidden = isReg;
+  if (modalDesc) {
+    modalDesc.textContent = isReg
+      ? "Preencha nome, e-mail e senha para criar sua conta e salvar suas análises no Amazon S3."
+      : "Entre com seu e-mail e senha para sincronizar suas imagens e análises com a nuvem (Amazon S3).";
+  }
 
   if (badge) {
     if (a.authenticated && a.user) {
-      var roleTag = String(a.user.role || "operator").toUpperCase();
       badge.className = "tag-auth-ok";
-      badge.textContent = "OPERADOR: " + a.user.name + " [" + roleTag + "]";
-      badge.title = "Autenticado como " + a.user.email + " (storage: " + (a.user.storage_backend || "memory") + ")";
+      badge.textContent = "CONTA: " + (a.user.name || a.user.email);
+      badge.title = "Autenticado como " + a.user.email + " · Sincronização S3 ativa";
     } else {
       badge.className = "tag-replica";
-      badge.textContent = "SESSÃO: NÃO AUTENTICADO";
-      badge.title = "Clique em Autenticar para iniciar sessão de operador";
+      badge.textContent = "MODO LOCAL · NÃO LOGADO";
+      badge.title = "Imagens salvas apenas localmente. Faça login para salvar no Amazon S3.";
     }
   }
 
   if (btnLabel) {
-    btnLabel.textContent = (a.authenticated && a.user) ? "Sair" : "Autenticar";
+    btnLabel.textContent = (a.authenticated && a.user) ? "Sair" : "Entrar";
   }
 
   if (alertBox) {
@@ -929,9 +931,9 @@ function renderAuthUI() {
   if (submitBtn) {
     submitBtn.disabled = !!a.loading;
     if (a.loading) {
-      submitBtn.textContent = isReg ? "Cadastrando..." : "Autenticando...";
+      submitBtn.textContent = isReg ? "Criando conta..." : "Entrando...";
     } else {
-      submitBtn.textContent = isReg ? "Concluir Cadastro" : "Entrar no Console";
+      submitBtn.textContent = isReg ? "Criar Conta" : "Entrar";
     }
   }
 }

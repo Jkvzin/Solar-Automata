@@ -417,17 +417,6 @@ function initEvents() {
   var authTabRegister = $("#authTabRegister");
   if (authTabRegister) authTabRegister.addEventListener("click", function() { setAuthMode("register"); });
 
-  var authDemoFillBtn = $("#authDemoFillBtn");
-  if (authDemoFillBtn) {
-    authDemoFillBtn.addEventListener("click", function() {
-      var em = $("#authEmail"), pw = $("#authPassword");
-      if (em) em.value = "operador@luminapv.local";
-      if (pw) pw.value = "LuminaPV@2026";
-      state.auth.error = null;
-      renderAuthUI();
-    });
-  }
-
   var authForm = $("#authForm");
   if (authForm) {
     authForm.addEventListener("submit", function(e) {
@@ -437,7 +426,6 @@ function initEvents() {
       var password = ($("#authPassword") && $("#authPassword").value || "");
       var name = ($("#authName") && $("#authName").value || "").trim();
       var confirmPw = ($("#authPasswordConfirm") && $("#authPasswordConfirm").value || "");
-      var role = ($("#authRole") && $("#authRole").value || "operator");
 
       if (!email || email.indexOf("@") < 1) {
         state.auth.error = "Informe um endereço de e-mail válido.";
@@ -452,7 +440,7 @@ function initEvents() {
 
       if (mode === "register") {
         if (!name || name.length < 2) {
-          state.auth.error = "Informe o nome completo do operador (mín. 2 caracteres).";
+          state.auth.error = "Informe seu nome (mín. 2 caracteres).";
           renderAuthUI();
           return;
         }
@@ -461,7 +449,7 @@ function initEvents() {
           renderAuthUI();
           return;
         }
-        authRegister(name, email, password, role).catch(function() {});
+        authRegister(name, email, password, confirmPw).catch(function() {});
       } else {
         authLogin(email, password).catch(function() {});
       }
@@ -478,7 +466,11 @@ function initEvents() {
   var historyRefreshBtn = $("#historyRefreshBtn");
   if (historyRefreshBtn) {
     historyRefreshBtn.addEventListener("click", function() {
-      if (typeof fetchUserHistory === "function") fetchUserHistory();
+      if (typeof syncAndLoadUserHistory === "function") {
+        syncAndLoadUserHistory();
+      } else if (typeof fetchUserHistory === "function") {
+        fetchUserHistory();
+      }
     });
   }
 
@@ -544,6 +536,9 @@ function boot() {
   });
 
   log("info", "Console iniciado · endpoint " + API_ENDPOINT + " · nenhuma simulação no cliente");
+  if (typeof loadLocalModules === "function") {
+    loadLocalModules();
+  }
   renderAll();
   if (typeof authVerifySession === "function") authVerifySession();
   var sbH = $("#sbHttp");

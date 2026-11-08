@@ -675,13 +675,14 @@ async def analyze_bulk(
 
     for idx, raw_mod in enumerate(raw_modules, start=1):
         m = dict(raw_mod) if isinstance(raw_mod, dict) else {}
-        mid = m.get("module_id")
-        if not mid or mid in seen_ids:
-            mid = f"MOD-2026-{idx:03d}"
-            m["module_id"] = mid
-        seen_ids.add(mid)
-
         content, name, ctype, scan_id = file_payloads[idx - 1]
+        mid = m.get("module_id")
+        if not mid:
+            mid = f"MOD-2026-{idx:03d}"
+        elif mid in seen_ids:
+            mid = f"{mid}-{scan_id[:4].upper()}"
+        m["module_id"] = mid
+
         if not m.get("timestamp"):
             m["timestamp"] = batch_ts
 
@@ -693,6 +694,7 @@ async def analyze_bulk(
             user=current_user,
             scan_id=scan_id
         )
+        seen_ids.add(m.get("module_id", mid))
         modules.append(m)
 
     # Compute batch-wide aggregated telemetry

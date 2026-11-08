@@ -16,6 +16,7 @@ Implements:
 """
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 import json
 import logging
@@ -109,6 +110,10 @@ class UserHistoryListResponse(BaseModel):
     history: List[Dict[str, Any]]
 
 
+class SyncHistoryRequest(BaseModel):
+    modules: List[Dict[str, Any]] = Field(default_factory=list, description="Locally processed module inspections to sync to S3")
+
+
 # -----------------------------------------------------------------------------
 # In-Memory & S3 Hybrid History Repository (Ports & Adapters)
 # -----------------------------------------------------------------------------
@@ -181,7 +186,14 @@ class InMemoryHistoryRepository:
     async def get_image(self, user_id: str, module_id: str) -> Optional[Tuple[bytes, str]]:
         uid = user_id or "anonymous"
         async with self._lock:
-            return self._images_by_user_mod.get((uid, module_id))
+            direct = self._images_by_user_mod.get((uid, module_id))
+            if direct is not None:
+                return direct
+            user_bucket = self._reports_by_user.get(uid, {})
+            for k, v in user_bucket.items():
+                if v.get("scan_id") == module_id:
+                    return self._images_by_user_mod.get((uid, k))
+        return None
 
     async def clear(self) -> None:
         async with self._lock:
@@ -259,31 +271,75 @@ class UserHistoryService:
     ) -> Dict[str, Any]:
         """
         Persists both the raw uploaded module scan image and the complete ModuleResult JSON
-        under the user-partitioned S3 keys:
+        under the user-partitioned S3 keys ONLY when the user is authenticated:
           - users/{user_id}/scans/{scan_id}_{filename}
           - users/{user_id}/reports/{scan_id}_{module_id}.json
-        (or anonymous/scans/... and anonymous/reports/... when unauthenticated).
+        When unauthenticated (user is None), does NOT upload to S3 or SQS; keeps record
+        as local-only so it can be persisted locally on the client and synced after login.
         """
-        user_id = user.user_id if user is not None else "anonymous"
-        scan_uid = scan_id or uuid.uuid4().hex[:12]
-        module_id = str(module_data.get("module_id") or f"MOD-2026-{scan_uid[:6].upper()}")
+        is_authenticated = (
+            user is not None
+            and bool(getattr(user, "user_id", None))
+            and user.user_id != "anonymous"
+        )
+        user_id = user.user_id if is_authenticated else "anonymous"
+        scan_uid = scan_id or str(module_data.get("scan_id") or "").strip() or uuid.uuid4().hex[:12]
+        base_module_id = str(module_data.get("module_id") or f"MOD-2026-{scan_uid[:6].upper()}")
         now_iso = str(module_data.get("timestamp") or datetime.now(timezone.utc).isoformat())
+
+        # Prevent silent overwrite if another scan with the same module_id already exists for this user
+        existing = await self.memory_repo.get_record(user_id, base_module_id)
+        if existing is not None and existing.get("scan_id") and existing.get("scan_id") != scan_uid:
+            module_id = f"{base_module_id}-{scan_uid[:4].upper()}"
+        else:
+            module_id = base_module_id
+
+        safe_filename = filename or str(module_data.get("filename") or "module.png")
+
+        if not is_authenticated:
+            # Unauthenticated mode: DO NOT save to S3 or SQS. Keep local-only metadata.
+            module_data["module_id"] = module_id
+            module_data["scan_id"] = scan_uid
+            module_data["user_id"] = "anonymous"
+            module_data["filename"] = safe_filename
+            module_data["timestamp"] = now_iso
+            module_data["s3_image_key"] = None
+            module_data["s3_report_key"] = None
+            module_data["persisted_in_s3"] = False
+            module_data["storage_scope"] = "local"
+
+            # Cache in ephemeral memory so if the user logs in during this session, raw bytes can be synced
+            await self.memory_repo.save_record(
+                user_id="anonymous",
+                module_id=module_id,
+                report=module_data,
+                image_bytes=image_bytes,
+                content_type=content_type or "image/png"
+            )
+            return module_data
 
         image_key, report_key = build_user_partition_keys(
             user_id=user_id,
             scan_id=scan_uid,
-            filename=filename,
+            filename=safe_filename,
             module_id=module_id
         )
+
+        presigned = self.generate_presigned_image_url(image_key)
 
         # Enrich module payload with canonical metadata & S3 keys
         module_data["module_id"] = module_id
         module_data["scan_id"] = scan_uid
         module_data["user_id"] = user_id
-        module_data["filename"] = filename or module_data.get("filename") or "module.png"
+        module_data["filename"] = safe_filename
         module_data["timestamp"] = now_iso
         module_data["s3_image_key"] = image_key
         module_data["s3_report_key"] = report_key
+        module_data["persisted_in_s3"] = True
+        module_data["storage_scope"] = "s3"
+        module_data["image_url"] = presigned
+        module_data["presigned_url"] = presigned
+        module_data["fallback_image_url"] = f"/api/v1/user/history/{module_id}/image"
 
         # Always store in local fallback repository for Read-Your-Writes and offline resilience
         await self.memory_repo.save_record(
@@ -301,13 +357,14 @@ class UserHistoryService:
         if s3 is not None:
             try:
                 report_bytes = json.dumps(module_data, indent=2).encode("utf-8")
-                await asyncio.to_thread(
-                    s3.put_object,
-                    Bucket=self.bucket_name,
-                    Key=image_key,
-                    Body=image_bytes,
-                    ContentType=content_type or "image/png"
-                )
+                if image_bytes:
+                    await asyncio.to_thread(
+                        s3.put_object,
+                        Bucket=self.bucket_name,
+                        Key=image_key,
+                        Body=image_bytes,
+                        ContentType=content_type or "image/png"
+                    )
                 await asyncio.to_thread(
                     s3.put_object,
                     Bucket=self.bucket_name,
@@ -335,6 +392,67 @@ class UserHistoryService:
 
         return module_data
 
+    async def sync_local_modules_to_user(
+        self,
+        user: UserRecord,
+        modules: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Synchronizes locally stored unauthenticated module inspections (including their
+        already-processed JSON and image data) to the authenticated user's S3 partition
+        without re-running computer vision inference.
+        """
+        existing_items, _ = await self.list_user_history(user_id=user.user_id, limit=500, offset=0)
+        existing_scan_ids = {item.get("scan_id") for item in existing_items if item.get("scan_id")}
+
+        async def _sync_single_module(mod: Dict[str, Any], scan_uid: str) -> None:
+            mod_id = str(mod.get("module_id") or f"MOD-2026-{scan_uid[:6].upper()}")
+            filename = str(mod.get("filename") or f"{mod_id}.png")
+
+            # 1. Check if raw image bytes are cached in anonymous memory repository
+            cached_img = (
+                await self.memory_repo.get_image("anonymous", mod_id)
+                or await self.memory_repo.get_image("anonymous", scan_uid)
+            )
+            img_bytes = b""
+            ctype = "image/png"
+            if cached_img is not None:
+                img_bytes, ctype = cached_img
+            else:
+                # 2. Fallback: decode base64 rectified_image from client payload
+                rect_b64 = str(mod.get("rectified_image") or "")
+                if rect_b64:
+                    try:
+                        raw_b64 = rect_b64.split(",", 1)[1] if "," in rect_b64 else rect_b64
+                        img_bytes = base64.b64decode(raw_b64)
+                    except Exception:
+                        img_bytes = b""
+
+            await self.persist_module_inspection(
+                module_data=dict(mod),
+                image_bytes=img_bytes,
+                filename=filename,
+                content_type=ctype,
+                user=user,
+                scan_id=scan_uid
+            )
+            await self.memory_repo.delete_record("anonymous", mod_id)
+
+        sync_tasks = []
+        for mod in modules or []:
+            if not isinstance(mod, dict):
+                continue
+            scan_uid = str(mod.get("scan_id") or "").strip() or uuid.uuid4().hex[:12]
+            if scan_uid in existing_scan_ids:
+                continue
+            existing_scan_ids.add(scan_uid)
+            sync_tasks.append(_sync_single_module(mod, scan_uid))
+
+        if sync_tasks:
+            await asyncio.gather(*sync_tasks)
+
+        return await self.list_user_history(user_id=user.user_id, limit=100, offset=0)
+
     def _enrich_with_urls(self, record: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(record)
         s3_image_key = enriched.get("s3_image_key") or ""
@@ -356,14 +474,18 @@ class UserHistoryService:
         Combines any records discovered in S3 under users/{user_id}/reports/ with the
         Read-Your-Writes local repository and generates fresh pre-signed S3 URLs.
         """
-        records_by_mod_id: Dict[str, Dict[str, Any]] = {}
+        records_by_key: Dict[str, Dict[str, Any]] = {}
+        seen_scan_ids: set = set()
 
         # 1. Load from local Read-Your-Writes store
         local_records = await self.memory_repo.list_records(user_id)
         for rec in local_records:
             mid = rec.get("module_id")
+            sid = rec.get("scan_id") or mid
             if mid:
-                records_by_mod_id[mid] = rec
+                records_by_key[mid] = rec
+                if sid:
+                    seen_scan_ids.add(sid)
 
         # 2. Attempt to list from S3 under users/{user_id}/reports/ if S3 client is configured
         s3 = self.get_s3_client()
@@ -409,13 +531,30 @@ class UserHistoryService:
                     fetched_reports = await asyncio.gather(*[fetch_single_s3_report(k) for k in target_keys])
                     for s3_rec in fetched_reports:
                         if s3_rec:
-                            mid = s3_rec.get("module_id")
-                            if mid and mid not in records_by_mod_id:
-                                records_by_mod_id[mid] = s3_rec
+                            mid = str(s3_rec.get("module_id") or "")
+                            sid = str(s3_rec.get("scan_id") or "")
+                            if not mid:
+                                continue
+                            if sid and sid in seen_scan_ids:
+                                continue
+                            if mid in records_by_key and sid:
+                                existing_sid = records_by_key[mid].get("scan_id")
+                                if existing_sid and existing_sid != sid:
+                                    mid = f"{mid}-{sid[:4].upper()}"
+                                    s3_rec["module_id"] = mid
+                            if mid not in records_by_key:
+                                records_by_key[mid] = s3_rec
+                                if sid:
+                                    seen_scan_ids.add(sid)
+                                await self.memory_repo.save_record(
+                                    user_id=user_id,
+                                    module_id=mid,
+                                    report=s3_rec
+                                )
             except Exception as list_exc:
                 logger.debug(f"S3 list_objects_v2 fallback for user '{user_id}': {list_exc}")
 
-        all_records = list(records_by_mod_id.values())
+        all_records = list(records_by_key.values())
         all_records.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
         total = len(all_records)
 
@@ -444,6 +583,11 @@ class UserHistoryService:
         Deletes a module inspection record from both the local repository and S3.
         """
         removed = await self.memory_repo.delete_record(user_id, module_id)
+        if removed is None:
+            detail = await self.get_user_module_detail(user_id, module_id)
+            if detail is not None:
+                removed = detail
+                await self.memory_repo.delete_record(user_id, detail.get("module_id", module_id))
         s3 = self.get_s3_client()
         if removed and s3 is not None:
             for key_field in ("s3_report_key", "s3_image_key"):
@@ -501,6 +645,31 @@ async def get_user_history(
         total=total,
         limit=limit,
         offset=offset,
+        items=items,
+        history=items
+    )
+
+
+@history_router.post(
+    "/api/v1/user/history/sync",
+    response_model=UserHistoryListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Sync locally processed unauthenticated inspections to the authenticated user's S3 bucket"
+)
+async def sync_user_history(
+    payload: SyncHistoryRequest,
+    current_user: UserRecord = Depends(get_current_active_user),
+    service: UserHistoryService = Depends(get_history_service)
+):
+    items, total = await service.sync_local_modules_to_user(
+        user=current_user,
+        modules=payload.modules
+    )
+    return UserHistoryListResponse(
+        user_id=current_user.user_id,
+        total=total,
+        limit=100,
+        offset=0,
         items=items,
         history=items
     )
@@ -588,6 +757,15 @@ async def get_user_history_image(
                         return Response(content=bytes(data), media_type="image/png")
             except Exception:
                 pass
+
+    if detail and detail.get("rectified_image"):
+        try:
+            rect_b64 = str(detail["rectified_image"])
+            raw_b64 = rect_b64.split(",", 1)[1] if "," in rect_b64 else rect_b64
+            img_bytes = base64.b64decode(raw_b64)
+            return Response(content=img_bytes, media_type="image/png")
+        except Exception:
+            pass
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,

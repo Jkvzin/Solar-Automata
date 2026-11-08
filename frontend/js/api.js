@@ -63,34 +63,123 @@ function setError(err) {
   live("Falha na análise: " + err.title);
 }
 
-function ingestPayload(data, source) {
-  if (!data || typeof data !== "object") throw new Error("Payload inválido");
-  var modules = Array.isArray(data.modules) ? data.modules : [];
-  var seenIds = {};
-  modules.forEach(function(m, idx) {
-    if (!m.module_id || seenIds[m.module_id]) {
-      m.module_id = (m.module_id ? m.module_id + "_" + pad2(idx + 1) : "MOD-2026-" + pad2(idx + 1));
+function recomputeBatchSummary(modules) {
+  var list = Array.isArray(modules) ? modules : [];
+  var totalMods = list.length;
+  var failMods = list.filter(function(m) { return m.status === "FAIL"; }).length;
+  var dmgSum = list.reduce(function(acc, m) { return acc + (+m.module_damage_percentage || 0); }, 0);
+  return {
+    total_modules: totalMods,
+    defective_modules_count: failMods,
+    batch_failure_percentage: totalMods ? Number(((failMods / totalMods) * 100).toFixed(1)) : 0,
+    average_cell_degradation_percentage: totalMods ? Number((dmgSum / totalMods).toFixed(1)) : 0
+  };
+}
+
+function saveLocalModules() {
+  if (typeof LOCAL_MODULES_KEY === "undefined") return;
+  try {
+    if (!state.modules || !state.modules.length) {
+      localStorage.removeItem(LOCAL_MODULES_KEY);
+      return;
     }
-    seenIds[m.module_id] = true;
-  });
-  state.modules = modules;
-  state.summary = data.batch_summary || {};
-  if (!state.summary.total_modules) state.summary.total_modules = modules.length;
-  if (state.summary.defective_modules_count === undefined) {
-    state.summary.defective_modules_count = modules.filter(function(m) { return m.status === "FAIL"; }).length;
+    localStorage.setItem(LOCAL_MODULES_KEY, JSON.stringify(state.modules));
+  } catch (e) {
+    // Fallback if localStorage quota is exceeded by large base64 images: store compact copy
+    try {
+      var compact = state.modules.map(function(m) {
+        var copy = Object.assign({}, m);
+        if (copy.image_url && copy.persisted_in_s3) {
+          delete copy.rectified_image;
+        }
+        return copy;
+      });
+      localStorage.setItem(LOCAL_MODULES_KEY, JSON.stringify(compact));
+    } catch (e2) {}
   }
+}
+
+function loadLocalModules() {
+  if (typeof LOCAL_MODULES_KEY === "undefined") return false;
+  try {
+    var raw = localStorage.getItem(LOCAL_MODULES_KEY);
+    if (!raw) return false;
+    var parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      ingestPayload({ modules: parsed }, "Persistência Local", { replace: true, skipSave: true });
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+function ingestPayload(data, source, opts) {
+  if (!data || typeof data !== "object") throw new Error("Payload inválido");
+  opts = opts || {};
+  var incoming = Array.isArray(data.modules) ? data.modules : [];
+  var baseModules = opts.replace ? [] : (Array.isArray(state.modules) ? state.modules.slice() : []);
+  var seenIds = {};
+  baseModules.forEach(function(m) {
+    if (m && m.module_id) seenIds[m.module_id] = true;
+  });
+
+  var lastAddedId = null;
+  incoming.forEach(function(m, idx) {
+    if (!m || typeof m !== "object") return;
+    if (!m.module_id) {
+      m.module_id = "MOD-2026-" + pad2(baseModules.length + idx + 1);
+    }
+
+    // Check if this module already exists in baseModules (by scan_id or module_id)
+    var matchIdx = -1;
+    for (var i = 0; i < baseModules.length; i++) {
+      var existing = baseModules[i];
+      if (m.scan_id && existing.scan_id && m.scan_id === existing.scan_id) {
+        matchIdx = i;
+        break;
+      }
+      if (!opts.fromUpload && existing.module_id === m.module_id) {
+        matchIdx = i;
+        break;
+      }
+    }
+
+    if (matchIdx >= 0) {
+      baseModules[matchIdx] = Object.assign({}, baseModules[matchIdx], m);
+      lastAddedId = baseModules[matchIdx].module_id;
+      seenIds[lastAddedId] = true;
+    } else {
+      if (seenIds[m.module_id]) {
+        var suffix = m.scan_id ? String(m.scan_id).slice(0, 4).toUpperCase() : pad2(baseModules.length + idx + 1);
+        m.module_id = m.module_id + "-" + suffix;
+      }
+      seenIds[m.module_id] = true;
+      baseModules.push(m);
+      lastAddedId = m.module_id;
+    }
+  });
+
+  state.modules = baseModules;
+  state.summary = recomputeBatchSummary(state.modules);
   state.data = { batch_summary: state.summary, modules: state.modules };
   var prev = state.activeId;
-  state.activeId = (prev && moduleById(prev)) ? prev : (modules.length ? modules[0].module_id : null);
+  if (opts.fromUpload && lastAddedId) {
+    state.activeId = lastAddedId;
+  } else {
+    state.activeId = (prev && moduleById(prev)) ? prev : (state.modules.length ? state.modules[0].module_id : null);
+  }
   state.selectedCell = null;
   state.distAnimated = false;
   state.distValues = null;
   state.errorId = null;
   state.loading = false;
   state.retries = 0;
-  log("ok", "Payload aplicado (" + source + ") · " + modules.length + " módulos · " + int(state.summary.total_modules) + " inspecionados");
+  if (!opts.skipSave) {
+    saveLocalModules();
+  }
+  log("ok", "Payload aplicado (" + source + ") · " + incoming.length + " recebido(s) · " + int(state.summary.total_modules) + " módulo(s) ativo(s)");
   renderAll();
-  live("Análise recebida. " + modules.length + " módulos carregados no explorador.");
+  live("Análise recebida. " + state.modules.length + " módulos carregados no explorador.");
 }
 
 function postBulk(files) {
@@ -217,7 +306,7 @@ function postBulk(files) {
         log("ok", "Consistência Read-Your-Writes: " + repCount + " módulo(s) replicado(s) · " + cacheCount + " cache hit(s)");
         log("info", "Exclusão mútua concluída: locks distribuídos por módulo liberados com sucesso");
       }
-      ingestPayload(data, "HTTP " + status);
+      ingestPayload(data, "HTTP " + status, { fromUpload: true });
       pollClusterStatus();
       if (state.auth && state.auth.authenticated && typeof fetchUserHistory === "function") {
         fetchUserHistory();
@@ -282,7 +371,7 @@ function ingest(files) {
   }
   if (images.length) {
     state.pendingFiles = images;
-    state.files = images;
+    state.files = (state.files || []).concat(images);
     state.loading = true;
     state.retries = 0;
     state.errorId = null;
@@ -550,10 +639,10 @@ function authLogin(email, password) {
     .then(function(data) {
       state.auth.loading = false;
       saveAuthSession(data.access_token, data.user);
-      log("ok", "Operador autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "] · storage=" + (data.user.storage_backend || "memory"));
+      log("ok", "Sessão autenticada: " + data.user.name + " <" + data.user.email + "> · storage=" + (data.user.storage_backend || "memory"));
       live("Sessão iniciada como " + data.user.name);
       if (typeof closeAuthModal === "function") closeAuthModal();
-      if (typeof fetchUserHistory === "function") fetchUserHistory();
+      syncAndLoadUserHistory();
       return data;
     })
     .catch(function(err) {
@@ -565,7 +654,7 @@ function authLogin(email, password) {
     });
 }
 
-function authRegister(name, email, password, role) {
+function authRegister(name, email, password, passwordConfirm) {
   state.auth.loading = true;
   state.auth.error = null;
   if (typeof renderAuthUI === "function") renderAuthUI();
@@ -577,7 +666,7 @@ function authRegister(name, email, password, role) {
       name: name,
       email: email,
       password: password,
-      role: role || "operator"
+      password_confirm: passwordConfirm || password
     })
   })
     .then(function(res) {
@@ -592,16 +681,16 @@ function authRegister(name, email, password, role) {
     .then(function(data) {
       state.auth.loading = false;
       saveAuthSession(data.access_token, data.user);
-      log("ok", "Novo operador cadastrado e autenticado: " + data.user.name + " <" + data.user.email + "> [" + String(data.user.role || "operator").toUpperCase() + "]");
-      live("Cadastro concluído. Sessão iniciada como " + data.user.name);
+      log("ok", "Conta criada e autenticada: " + data.user.name + " <" + data.user.email + ">");
+      live("Conta criada. Sessão iniciada como " + data.user.name);
       if (typeof closeAuthModal === "function") closeAuthModal();
-      if (typeof fetchUserHistory === "function") fetchUserHistory();
+      syncAndLoadUserHistory();
       return data;
     })
     .catch(function(err) {
       state.auth.loading = false;
       state.auth.error = (err && err.message) ? err.message : "Não foi possível concluir o cadastro.";
-      log("error", "Falha no cadastro de operador: " + state.auth.error);
+      log("error", "Falha ao criar conta: " + state.auth.error);
       if (typeof renderAuthUI === "function") renderAuthUI();
       throw err;
     });
@@ -609,8 +698,19 @@ function authRegister(name, email, password, role) {
 
 function authLogout() {
   var tok = state.auth.token;
-  var prevEmail = state.auth.user ? state.auth.user.email : "operador";
+  var prevEmail = state.auth.user ? state.auth.user.email : "usuário";
   clearAuthSession();
+  state.modules = [];
+  state.summary = {};
+  state.data = null;
+  state.activeId = null;
+  state.selectedCell = null;
+  state.files = [];
+  state.pendingFiles = [];
+  if (typeof LOCAL_MODULES_KEY !== "undefined") {
+    try { localStorage.removeItem(LOCAL_MODULES_KEY); } catch (e) {}
+  }
+  if (typeof renderAll === "function") renderAll();
   log("info", "Sessão encerrada para " + prevEmail + " · token revogado");
   live("Sessão encerrada.");
 
@@ -660,7 +760,7 @@ function authVerifySession() {
     .then(function(userDto) {
       if (userDto && userDto.email) {
         saveAuthSession(savedToken, userDto);
-        if (typeof fetchUserHistory === "function") fetchUserHistory();
+        syncAndLoadUserHistory();
       }
       return userDto;
     })
@@ -671,6 +771,63 @@ function authVerifySession() {
 }
 
 /* ---------- user analysis history & S3 gallery ---------- */
+function syncAndLoadUserHistory() {
+  if (!state.auth || !state.auth.authenticated || !state.auth.token) {
+    return Promise.resolve([]);
+  }
+  var syncEndpoint = (typeof HISTORY_SYNC_ENDPOINT !== "undefined") ? HISTORY_SYNC_ENDPOINT : "/api/v1/user/history/sync";
+  var localUnsynced = (state.modules || []).filter(function(m) {
+    return m && (!m.persisted_in_s3 || m.user_id === "anonymous" || m.storage_scope === "local");
+  });
+
+  var syncPromise;
+  if (localUnsynced.length > 0) {
+    log("req", "Sincronizando " + localUnsynced.length + " análise(s) local(is) com o Amazon S3 da conta...");
+    syncPromise = fetch(syncEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + state.auth.token
+      },
+      body: JSON.stringify({ modules: localUnsynced })
+    })
+      .then(function(res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function(body) {
+        var list = (body && Array.isArray(body.items)) ? body.items : ((body && Array.isArray(body.history)) ? body.history : []);
+        log("ok", "Sincronização S3 concluída: " + localUnsynced.length + " módulo(s) local(is) salvo(s) no S3.");
+        return list;
+      })
+      .catch(function(err) {
+        log("warn", "Falha ao sincronizar módulos locais com S3 (" + (err && err.message ? err.message : "erro") + ") — consultando histórico S3.");
+        return fetchUserHistory(100);
+      });
+  } else {
+    syncPromise = fetchUserHistory(100);
+  }
+
+  return syncPromise.then(function(list) {
+    if (!Array.isArray(list)) list = [];
+    state.history.items = list;
+    state.history.loading = false;
+    state.history.error = null;
+    if (typeof renderHistory === "function") renderHistory();
+
+    // Populate the main client interface (Explorer, Optical Viewport, Inspector, JSON Payload)
+    // directly from the already-processed JSON + S3 image URLs without reprocessing!
+    if (list.length > 0) {
+      ingestPayload(
+        { modules: list },
+        "S3 Cloud Sync · " + list.length + " módulo(s) restaurado(s)",
+        { replace: true }
+      );
+    }
+    return list;
+  });
+}
+
 function fetchUserHistory(limit) {
   if (!state.auth || !state.auth.authenticated || !state.auth.token) {
     if (state.history) {
@@ -739,34 +896,8 @@ function loadHistoricalModule(moduleId) {
   function applyHistoricalModuleToStage(modObj) {
     if (!modObj || typeof modObj !== "object") return null;
     state.history.selectedItem = modObj.module_id;
-
-    // Preserve existing batch modules or upsert the historical module so inspector & charts work seamlessly
-    var existingIdx = -1;
-    for (var i = 0; i < state.modules.length; i++) {
-      if (state.modules[i].module_id === modObj.module_id) {
-        existingIdx = i;
-        break;
-      }
-    }
-    var updatedModules = state.modules.slice();
-    if (existingIdx >= 0) {
-      updatedModules[existingIdx] = modObj;
-    } else {
-      updatedModules.unshift(modObj);
-    }
-
-    var totalMods = updatedModules.length;
-    var failMods = updatedModules.filter(function(m) { return m.status === "FAIL"; }).length;
-    var dmgSum = updatedModules.reduce(function(acc, m) { return acc + (+m.module_damage_percentage || 0); }, 0);
-    var summary = {
-      total_modules: totalMods,
-      defective_modules_count: failMods,
-      batch_failure_percentage: totalMods ? Number(((failMods / totalMods) * 100).toFixed(1)) : 0,
-      average_cell_degradation_percentage: totalMods ? Number((dmgSum / totalMods).toFixed(1)) : 0
-    };
-
     state.activeId = modObj.module_id;
-    ingestPayload({ batch_summary: summary, modules: updatedModules }, "Histórico S3 · " + modObj.module_id);
+    ingestPayload({ modules: [modObj] }, "Histórico S3 · " + modObj.module_id);
     selectModule(modObj.module_id);
     if (typeof renderHistory === "function") renderHistory();
     live("Módulo histórico " + modObj.module_id + " carregado no inspetor óptico.");
@@ -819,8 +950,17 @@ function deleteHistoricalModule(moduleId) {
       if (state.history.selectedItem === moduleId) {
         state.history.selectedItem = null;
       }
-      log("info", "Inspeção " + moduleId + " removida do histórico S3 do operador.");
-      if (typeof renderHistory === "function") renderHistory();
+      state.modules = (state.modules || []).filter(function(m) {
+        return m.module_id !== moduleId;
+      });
+      state.summary = recomputeBatchSummary(state.modules);
+      state.data = { batch_summary: state.summary, modules: state.modules };
+      if (state.activeId === moduleId) {
+        state.activeId = state.modules.length ? state.modules[0].module_id : null;
+      }
+      saveLocalModules();
+      log("info", "Inspeção " + moduleId + " removida do histórico S3 e do explorador.");
+      if (typeof renderAll === "function") renderAll();
       return true;
     })
     .catch(function(err) {

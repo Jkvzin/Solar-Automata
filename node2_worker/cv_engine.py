@@ -1500,14 +1500,15 @@ def generate_module_id(filename: str, fallback_idx: int = 1) -> str:
     if match:
         return match.group(1).upper()
     
-    # Check for scan_XX or panel_XX pattern
-    match_seq = re.search(r'(?:scan|panel|module|scan_module)[_-](\d{1,4})', filename, re.IGNORECASE)
+    # Check for scan_XX or panel_XX sequence pattern (excluding grid dimensions like 6x10 or 12x10)
+    match_seq = re.search(r'(?:scan|panel|module|scan_module)[_-](\d{1,4})(?![xX0-9])', filename, re.IGNORECASE)
     if match_seq:
         num = int(match_seq.group(1))
         return f"MOD-2026-{num:03d}"
 
-    # Use deterministic hash of filename to guarantee distinct IDs across different files
-    h = (abs(hash(filename)) % 900) + 100
+    # Use deterministic SHA-256 hash of filename to guarantee distinct IDs across different files
+    digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+    h = (int(digest[:8], 16) % 900) + 100
     return f"MOD-2026-{h:03d}"
 
 
