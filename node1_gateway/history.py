@@ -376,10 +376,15 @@ class UserHistoryService:
                     Prefix=prefix
                 )
                 if isinstance(list_resp, dict) and isinstance(list_resp.get("Contents"), list):
-                    for obj in list_resp["Contents"]:
-                        key = obj.get("Key", "")
-                        if not key.endswith(".json"):
-                            continue
+                    report_keys = [
+                        obj["Key"] for obj in list_resp["Contents"]
+                        if isinstance(obj.get("Key"), str) and obj["Key"].endswith(".json")
+                    ]
+                    # Sort keys to prioritize most recent files before fetching
+                    report_keys.sort(reverse=True)
+                    target_keys = report_keys[:limit] if limit > 0 else report_keys
+
+                    async def fetch_single_s3_report(key: str) -> Optional[Dict[str, Any]]:
                         try:
                             get_resp = await asyncio.to_thread(
                                 s3.get_object,
@@ -394,13 +399,19 @@ class UserHistoryService:
                                 elif isinstance(raw_bytes, str):
                                     s3_rec = json.loads(raw_bytes)
                                 else:
-                                    continue
+                                    return None
                                 if isinstance(s3_rec, dict) and s3_rec.get("user_id", user_id) == user_id:
-                                    mid = s3_rec.get("module_id")
-                                    if mid and mid not in records_by_mod_id:
-                                        records_by_mod_id[mid] = s3_rec
+                                    return s3_rec
                         except Exception as item_exc:
                             logger.debug(f"Skipping unreadable S3 report '{key}': {item_exc}")
+                        return None
+
+                    fetched_reports = await asyncio.gather(*[fetch_single_s3_report(k) for k in target_keys])
+                    for s3_rec in fetched_reports:
+                        if s3_rec:
+                            mid = s3_rec.get("module_id")
+                            if mid and mid not in records_by_mod_id:
+                                records_by_mod_id[mid] = s3_rec
             except Exception as list_exc:
                 logger.debug(f"S3 list_objects_v2 fallback for user '{user_id}': {list_exc}")
 
