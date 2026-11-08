@@ -140,6 +140,14 @@
             <div class="tele-k">Confiança média</div>
             <div class="tele-v" id="insConf">—</div>
           </div>
+          <div class="tele">
+            <div class="tele-k">Nó processador</div>
+            <div class="tele-v" style="font-size:11.5px" id="insNode">—</div>
+          </div>
+          <div class="tele">
+            <div class="tele-k">Replicação & IA</div>
+            <div class="tele-v" style="font-size:11px" id="insRep">—</div>
+          </div>
         </div>
       </div>
       <div class="insp" data-od-id="batch-profile">
@@ -167,6 +175,7 @@
       <div class="dock-tabs" role="tablist" aria-label="Doca de diagnóstico">
         <button type="button" role="tab" id="tab-payload" aria-selected="true" aria-controls="dockPayload" data-tab="payload">Payload bruto</button>
         <button type="button" role="tab" id="tab-dist" aria-selected="false" aria-controls="dockDist" data-tab="dist">Distribuição de defeitos</button>
+        <button type="button" role="tab" id="tab-topology" aria-selected="false" aria-controls="dockTopology" data-tab="topology">Topologia do cluster</button>
         <button type="button" role="tab" id="tab-log" aria-selected="false" aria-controls="dockLog" data-tab="log">Log do lote</button>
       </div>
       <span class="spacer"></span>
@@ -188,6 +197,54 @@
           <div class="legend" id="distLegend"></div>
         </div>
       </div>
+      <div id="dockTopology" role="tabpanel" aria-labelledby="tab-topology" hidden>
+        <div class="topology-panel" id="topologyPanel">
+          <div class="topo-summary" id="topoSummary">
+            <div class="topo-card">
+              <span class="topo-card-title">Líder Eleito</span>
+              <div class="topo-card-val"><span class="tag-leader" id="topoLeaderBadge">LEADER</span> <span id="topoLeaderId">—</span></div>
+              <span class="topo-card-sub" id="topoLeaderTerm">Termo — · Concessão Ativa</span>
+            </div>
+            <div class="topo-card">
+              <span class="topo-card-title">Esquema de Nomeação</span>
+              <div class="topo-card-val mono" id="topoServiceName">service://luminapv-vision-worker</div>
+              <span class="topo-card-sub" id="topoDnsDomain">Domínio .luminapv.local (Round-Robin)</span>
+            </div>
+            <div class="topo-card">
+              <span class="topo-card-title">Modelo de Consistência</span>
+              <div class="topo-card-val" id="topoConsistency">Read-Your-Writes</div>
+              <span class="topo-card-sub" id="topoReplicaSync">Sincronização Réplicas: Eventual</span>
+            </div>
+            <div class="topo-card">
+              <span class="topo-card-title">Replicação & Integridade</span>
+              <div class="topo-card-val"><span id="topoReplicationCount">0</span> <small style="font-size:11px;color:var(--muted2)">módulos</small></div>
+              <span class="topo-card-sub" id="topoModelIntegrity">Pesos IA: Verificados (SHA-256)</span>
+            </div>
+          </div>
+          <div class="topo-nodes-table-wrap">
+            <table class="topo-table" id="topoNodesTable">
+              <thead>
+                <tr>
+                  <th>Nó (ID)</th>
+                  <th>Nome Lógico / DNS</th>
+                  <th>Papel</th>
+                  <th>Status</th>
+                  <th>Endpoint</th>
+                  <th>Integridade IA (SHA-256)</th>
+                  <th>Último Heartbeat</th>
+                </tr>
+              </thead>
+              <tbody id="topoNodesBody">
+                <tr><td colspan="7" class="empty-mini">Aguardando telemetria do cluster (/api/v1/cluster/status)...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="topo-footer" id="topoFooter">
+            <span id="topoActiveLocks">Locks Distribuídos Ativos: Nenhum (seção crítica livre)</span>
+            <span id="topoClusterTime" class="mono">Cluster: Sincronizado</span>
+          </div>
+        </div>
+      </div>
       <div id="dockLog" role="tabpanel" aria-labelledby="tab-log" hidden>
         <div class="log" id="logOut"></div>
       </div>
@@ -197,6 +254,10 @@
 
 <footer class="statusbar" data-od-id="statusbar">
   <span class="sb"><span class="dot" id="sbDot"></span><span class="mono" id="sbState">PRONTO</span></span>
+  <span class="sb-sep" aria-hidden="true"></span>
+  <span class="sb mono" id="sbCluster" title="Topologia e nós do cluster"><span class="tag-leader" id="sbLeaderBadge">LÍDER: —</span> <span id="sbClusterNodes">— NÓS</span></span>
+  <span class="sb-sep" aria-hidden="true"></span>
+  <span class="sb mono" id="sbConsistency" title="Modelo de consistência ativo">CONSISTÊNCIA: RYW</span>
   <span class="sb-sep" aria-hidden="true"></span>
   <span class="sb mono" id="sbEndpoint">POST /api/v1/analyze/bulk</span>
   <span class="sb mono" id="sbHttp">HTTP —</span>
@@ -231,11 +292,15 @@
       "total_cells": 60,
       "defective_cells_count": 12,
       "module_damage_percentage": 20.0,
+      "processed_by_node": "worker-1",
+      "model_sha256": "5adbfb5908873752e805561a0b5f137e3d81b9e28e62f01f808fc52b20f92275",
+      "replicated": true,
+      "consistency_model": "read-your-writes",
       "cells": [
         { "index": 0, "row": 0, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.71 },
         { "index": 7, "row": 0, "col": 7, "is_defective": true, "defect_type": "dead", "confidence": 0.99 },
         { "index": 12, "row": 1, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.95 },
-        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.92 },
+        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "defeituosa", "confidence": 0.92 },
         { "index": 20, "row": 2, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.79 },
         { "index": 23, "row": 2, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.88 },
         { "index": 30, "row": 3, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.74 },
@@ -255,6 +320,11 @@
       "total_cells": 60,
       "defective_cells_count": 1,
       "module_damage_percentage": 1.7,
+      "processed_by_node": "worker-2",
+      "model_sha256": "5adbfb5908873752e805561a0b5f137e3d81b9e28e62f01f808fc52b20f92275",
+      "replicated": true,
+      "cache_hit": true,
+      "consistency_model": "read-your-writes",
       "cells": [
         { "index": 15, "row": 1, "col": 5, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.64 }
       ]

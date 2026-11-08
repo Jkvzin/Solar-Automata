@@ -419,7 +419,7 @@ function boot() {
   if (tb) tb.setAttribute("aria-pressed", light ? "true" : "false");
 
   var hash = (window.location.hash || "#payload").slice(1);
-  setDockTab(["payload", "dist", "log"].indexOf(hash) >= 0 ? hash : "payload");
+  setDockTab(["payload", "dist", "topology", "log"].indexOf(hash) >= 0 ? hash : "payload");
 
   try {
     var savedFilter = localStorage.getItem("luminapv.filter");

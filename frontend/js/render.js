@@ -62,8 +62,10 @@ function renderTree() {
   ul.innerHTML = list.map(function(m) {
     var fail = m.status === "FAIL";
     var tag = '<span class="tag ' + (fail ? "tag-fail" : "tag-pass") + '">' + (fail ? "FALHA" : "APROVADO") + '</span>';
+    var nodeTag = m.processed_by_node ? '<span class="tag-node" title="Processado por ' + esc(m.processed_by_node) + '">' + esc(m.processed_by_node) + '</span>' : '';
+    var repTag = m.cache_hit ? '<span class="tag-cache" title="Inferência recuperada do cache distribuído">CACHE</span>' : (m.replicated ? '<span class="tag-rep" title="Resultado replicado com consistência Read-Your-Writes">REPLICADO</span>' : '');
     return '<li role="option" aria-selected="' + (m.module_id === state.activeId) + '" data-id="' + esc(m.module_id) + '" class="mod' + (m.module_id === state.activeId ? " is-active" : "") + '" tabindex="' + (m.module_id === state.activeId ? "0" : "-1") + '">' +
-      '<span class="mod-top"><span class="mod-name" title="' + esc(m.filename || m.module_id) + '">' + esc(m.filename || m.module_id) + '</span>' + tag + '</span>' +
+      '<span class="mod-top"><span class="mod-name" title="' + esc(m.filename || m.module_id) + '">' + esc(m.filename || m.module_id) + '</span>' + nodeTag + repTag + tag + '</span>' +
       '<span class="mod-meta"><span>' + esc(m.module_id) + '</span><span>' + (+m.defective_cells_count || 0) + '/' + (+m.total_cells || 0) + ' cél.</span><span>dano ' + pct(m.module_damage_percentage) + '</span></span></li>';
   }).join("");
 
@@ -475,6 +477,30 @@ function renderInspector() {
   var insConf = $("#insConf");
   if (insConf) insConf.textContent = confs.length ? pct(confs.reduce(function(a, b) { return a + b; }, 0) / confs.length) : "—";
 
+  var insNode = $("#insNode");
+  if (insNode) {
+    if (m) {
+      var nName = m.processed_by_node || "worker-1";
+      var isL = state.cluster && state.cluster.leader_id && (nName.indexOf(state.cluster.leader_id) >= 0 || nName === state.cluster.leader_id);
+      insNode.innerHTML = '<span class="mono">' + esc(nName) + '</span>' + (isL ? ' <span class="tag-leader" style="font-size:8.5px">LÍDER</span>' : ' <span class="tag-replica" style="font-size:8.5px">RÉPLICA</span>');
+    } else {
+      insNode.textContent = "—";
+    }
+  }
+
+  var insRep = $("#insRep");
+  if (insRep) {
+    if (m) {
+      var rHtml = m.cache_hit ? '<span class="tag-cache">CACHE HIT</span>' : (m.replicated ? '<span class="tag-rep">REPLICADO (RYW)</span>' : '<span class="tag-replica">SÍNCRONO</span>');
+      if (m.model_sha256) {
+        rHtml += ' <span class="mono" style="font-size:9.5px;color:var(--muted2)" title="SHA-256 do best.pt: ' + esc(m.model_sha256) + '">[' + m.model_sha256.slice(0, 6) + '…]</span>';
+      }
+      insRep.innerHTML = rHtml;
+    } else {
+      insRep.textContent = "—";
+    }
+  }
+
   var countSpan = $("#cellPanelCount");
   if (countSpan) countSpan.textContent = dl.length ? (dl.length + " anomalias") : "0";
 
@@ -520,10 +546,11 @@ function setDockTab(name) {
     var on = b.dataset.tab === name;
     b.setAttribute("aria-selected", on ? "true" : "false");
   });
-  var dp = $("#dockPayload"), dd = $("#dockDist"), dl = $("#dockLog"), cb = $("#copyBtn");
+  var dp = $("#dockPayload"), dd = $("#dockDist"), dl = $("#dockLog"), dt = $("#dockTopology"), cb = $("#copyBtn");
   if (dp) dp.hidden = name !== "payload";
   if (dd) dd.hidden = name !== "dist";
   if (dl) dl.hidden = name !== "log";
+  if (dt) dt.hidden = name !== "topology";
   if (cb) cb.style.visibility = name === "payload" ? "visible" : "hidden";
 
   try { if (history.replaceState) history.replaceState(null, "", "#" + name); } catch (e) {}
@@ -535,6 +562,101 @@ function setDockTab(name) {
     } else {
       drawDist(1);
     }
+  } else if (name === "topology") {
+    renderTopology();
+  }
+}
+
+/* ---------- render: cluster topology ---------- */
+function renderTopology() {
+  var c = state.cluster;
+  var lId = $("#topoLeaderId");
+  var lTerm = $("#topoLeaderTerm");
+  var lBadge = $("#topoLeaderBadge");
+  var sName = $("#topoServiceName");
+  var dDomain = $("#topoDnsDomain");
+  var cModel = $("#topoConsistency");
+  var rSync = $("#topoReplicaSync");
+  var rCount = $("#topoReplicationCount");
+  var mInteg = $("#topoModelIntegrity");
+  var nBody = $("#topoNodesBody");
+  var aLocks = $("#topoActiveLocks");
+  var cTime = $("#topoClusterTime");
+
+  if (!c) {
+    if (lId) lId.textContent = "STANDALONE / LOCAL";
+    if (lTerm) lTerm.textContent = "Aguardando telemetria do cluster";
+    if (nBody) {
+      nBody.innerHTML = '<tr>' +
+        '<td><strong>worker-1</strong></td>' +
+        '<td class="mono">worker-1.luminapv.local</td>' +
+        '<td><span class="tag-leader">LÍDER</span></td>' +
+        '<td><span class="tag tag-pass">ONLINE</span></td>' +
+        '<td class="mono" style="color:var(--muted2)">http://localhost:8001</td>' +
+        '<td><span class="mono">best.pt (local)</span></td>' +
+        '<td class="mono">ativo</td>' +
+        '</tr>';
+    }
+    return;
+  }
+
+  var leaderId = c.leader_id || "worker-1";
+  var term = c.term || 1;
+  if (lId) lId.textContent = leaderId;
+  if (lTerm) lTerm.textContent = "Termo #" + term + " · Concessão Ativa (Redis Lease)";
+  if (lBadge) lBadge.textContent = "LEADER";
+
+  var naming = c.naming_scheme || {};
+  if (sName) sName.textContent = naming.service_name || "service://luminapv-vision-worker";
+  if (dDomain) dDomain.textContent = "Domínio ." + (naming.dns_domain || "luminapv.local") + " · Catálogo Dinâmico";
+
+  var repStats = c.replication_stats || {};
+  if (cModel) cModel.textContent = (repStats.consistency_model || c.consistency_model || "Read-Your-Writes").toUpperCase();
+  if (rSync) rSync.textContent = "Sincronização Réplicas: " + (repStats.secondary_replica_sync || "Eventual");
+  if (rCount) rCount.textContent = int(repStats.total_replicated_modules !== undefined ? repStats.total_replicated_modules : 0);
+  if (mInteg) {
+    var consistent = repStats.model_consistent !== false;
+    mInteg.innerHTML = consistent ? '<span style="color:var(--pass)">Pesos IA: Íntegros (SHA-256)</span>' : '<span style="color:var(--defect-ink)">Divergência de Pesos IA</span>';
+  }
+
+  var nodes = Array.isArray(c.nodes) ? c.nodes : [];
+  if (nBody) {
+    if (!nodes.length) {
+      nBody.innerHTML = '<tr><td colspan="7" class="empty-mini">Nenhum nó registrado no catálogo no momento.</td></tr>';
+    } else {
+      nBody.innerHTML = nodes.map(function(n) {
+        var isLeader = n.role === "LEADER" || n.node_id === leaderId;
+        var isOnline = (n.status || "ONLINE").toUpperCase() === "ONLINE";
+        var roleBadge = isLeader ? '<span class="tag-leader">LÍDER</span>' : '<span class="tag-replica">RÉPLICA</span>';
+        var statusBadge = isOnline ? '<span class="tag tag-pass">ONLINE</span>' : '<span class="tag tag-fail">OFFLINE</span>';
+        var shaShort = n.model_sha256 ? ('<span title="' + esc(n.model_sha256) + '" class="mono">' + esc(n.model_sha256.slice(0, 10)) + '…</span>') : '<span class="mono" style="color:var(--muted2)">—</span>';
+        var lastSeen = n.last_seen ? new Date(n.last_seen * 1000).toLocaleTimeString("pt-BR") : "ativo agora";
+        return '<tr>' +
+          '<td><strong>' + esc(n.node_id || "—") + '</strong></td>' +
+          '<td class="mono">' + esc(n.dns_name || (n.node_id + ".luminapv.local")) + '</td>' +
+          '<td>' + roleBadge + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td class="mono" style="color:var(--muted2)">' + esc(n.endpoint || "—") + '</td>' +
+          '<td>' + shaShort + '</td>' +
+          '<td class="mono">' + esc(lastSeen) + '</td>' +
+          '</tr>';
+      }).join("");
+    }
+  }
+
+  var locks = Array.isArray(c.active_locks) ? c.active_locks : [];
+  if (aLocks) {
+    if (!locks.length) {
+      aLocks.innerHTML = 'Locks Distribuídos Ativos: <span style="color:var(--pass)">Nenhum (seção crítica livre)</span>';
+    } else {
+      var lockNames = locks.map(function(lk) { return esc(lk.resource || lk); }).join(", ");
+      aLocks.innerHTML = 'Locks Distribuídos Ativos: <span style="color:var(--warn)">' + locks.length + ' em vigor (' + lockNames + ')</span>';
+    }
+  }
+
+  if (cTime) {
+    var ts = c.timestamp ? new Date(c.timestamp).toLocaleTimeString("pt-BR") : now();
+    cTime.textContent = "Última sincronização: " + ts;
   }
 }
 
@@ -554,6 +676,22 @@ function setStatusBar(mode, http) {
   var ct = computeCellTotals();
   var sbB = $("#sbBatch");
   if (sbB) sbB.textContent = state.modules.length ? ("LOTE " + state.modules.length + " MÓD · " + int(ct.defective) + " CÉL. ANÔMALAS") : "LOTE —";
+
+  var c = state.cluster;
+  var sbLeader = $("#sbLeaderBadge");
+  if (sbLeader) {
+    sbLeader.textContent = c && c.leader_id ? ("LÍDER: " + c.leader_id) : "LÍDER: —";
+  }
+  var sbNodes = $("#sbClusterNodes");
+  if (sbNodes) {
+    var count = (c && Array.isArray(c.nodes)) ? c.nodes.length : 0;
+    sbNodes.textContent = count ? (count + " NÓ" + (count > 1 ? "S" : "")) : "CLUSTER —";
+  }
+  var sbCons = $("#sbConsistency");
+  if (sbCons) {
+    var cm = (c && c.consistency_model) ? (c.consistency_model === "read-your-writes" ? "RYW / EVENTUAL" : c.consistency_model.toUpperCase()) : "RYW";
+    sbCons.textContent = "CONSISTÊNCIA: " + cm;
+  }
 }
 
 /* ---------- master render ---------- */
@@ -564,6 +702,7 @@ function renderAll() {
   renderViewport();
   renderInspector();
   renderJson();
+  renderTopology();
   setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
   var dd = $("#dockDist");
   if (state.distAnimated && dd && !dd.hidden) {

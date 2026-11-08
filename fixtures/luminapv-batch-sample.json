@@ -15,11 +15,15 @@
       "total_cells": 60,
       "defective_cells_count": 12,
       "module_damage_percentage": 20.0,
+      "processed_by_node": "worker-1",
+      "model_sha256": "5adbfb5908873752e805561a0b5f137e3d81b9e28e62f01f808fc52b20f92275",
+      "replicated": true,
+      "consistency_model": "read-your-writes",
       "cells": [
         { "index": 0, "row": 0, "col": 0, "is_defective": true, "defect_type": "grid-fault", "confidence": 0.71 },
         { "index": 7, "row": 0, "col": 7, "is_defective": true, "defect_type": "dead", "confidence": 0.99 },
         { "index": 12, "row": 1, "col": 2, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.95 },
-        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.92 },
+        { "index": 13, "row": 1, "col": 3, "is_defective": true, "defect_type": "defeituosa", "confidence": 0.92 },
         { "index": 20, "row": 2, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.79 },
         { "index": 23, "row": 2, "col": 3, "is_defective": true, "defect_type": "micro-crack", "confidence": 0.88 },
         { "index": 30, "row": 3, "col": 0, "is_defective": true, "defect_type": "delamination", "confidence": 0.74 },
@@ -39,6 +43,11 @@
       "total_cells": 60,
       "defective_cells_count": 1,
       "module_damage_percentage": 1.7,
+      "processed_by_node": "worker-2",
+      "model_sha256": "5adbfb5908873752e805561a0b5f137e3d81b9e28e62f01f808fc52b20f92275",
+      "replicated": true,
+      "cache_hit": true,
+      "consistency_model": "read-your-writes",
       "cells": [
         { "index": 24, "row": 2, "col": 4, "is_defective": true, "defect_type": "hot-spot", "confidence": 0.62 }
       ]
