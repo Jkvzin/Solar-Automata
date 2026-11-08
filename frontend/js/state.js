@@ -23,7 +23,11 @@ var state = {
   selectedCell: null,
   zoom: { scale: 1, tx: 0, ty: 0, fitScale: 1, natW: 0, natH: 0, raster: false },
   distAnimated: false,
-  distValues: null
+  distValues: null,
+  cluster: null,
+  clusterPollingInterval: null,
+  lastLeaderId: null,
+  lastNodesState: {}
 };
 
 /* ---------- formatting & string helpers ---------- */
