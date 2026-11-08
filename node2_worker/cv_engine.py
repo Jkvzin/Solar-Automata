@@ -628,6 +628,17 @@ def _detect_1d_dividers(
     if not raw_divs:
         return [], []
 
+    # Reject internal cell busbars: true inter-cell gaps exhibit deep P80 valleys
+    # (norm_vp80 >= 0.70), whereas internal cell busbars are significantly shallower.
+    strong_divs = [d for d in raw_divs if norm_vp80[d] >= 0.70]
+    if len(strong_divs) >= 3:
+        s_pts = [0] + strong_divs + [length]
+        s_diffs = np.diff(s_pts).astype(np.float32)
+        s_cv = float(np.std(s_diffs) / (np.mean(s_diffs) + 1e-6))
+        if s_cv < 0.28:
+            min_valid_vp80 = 0.65 * float(np.median([norm_vp80[d] for d in strong_divs]))
+            raw_divs = [d for d in raw_divs if norm_vp80[d] >= min_valid_vp80]
+
     # 2. Coalesce double-peaks caused by wide Half-Cut central junction gaps
     # If two adjacent candidate dividers bound a continuous dark trough (no bright cell body
     # between them), merge them into a single wide-gap divider
@@ -1139,10 +1150,29 @@ def get_yolo_classifier(weights_path: Optional[str] = None) -> YOLO:
     return _YOLO_CLASSIFIER
 
 
-def _format_cell_crop_bgr(cell_crop: np.ndarray) -> np.ndarray:
+def _trim_cell_gap_margins(cell_crop: np.ndarray, trim_ratio: float = 0.05) -> np.ndarray:
     """
-    Garante que o crop da célula possua 3 canais (BGR) e tipo uint8 para entrada no YOLOv8-cls.
+    Remove a margem periférica correspondente às frestas inter-células (cell gaps)
+    e sombras de moldura (~4 a 5 pixels), garantindo que apenas a área útil
+    do wafer de silício seja enviada ao classificador YOLOv8-cls.
     """
+    h, w = cell_crop.shape[:2]
+    if h < 16 or w < 16:
+        return cell_crop
+    ty = 4 if h <= 100 else max(4, min(6, int(round(h * trim_ratio))))
+    tx = 4 if w <= 100 else max(4, min(6, int(round(w * trim_ratio))))
+    if (h - 2 * ty) < 8 or (w - 2 * tx) < 8:
+        return cell_crop
+    return np.ascontiguousarray(cell_crop[ty:h - ty, tx:w - tx])
+
+
+def _format_cell_crop_bgr(cell_crop: np.ndarray, trim_border: bool = True) -> np.ndarray:
+    """
+    Garante que o crop da célula tenha as margens de fresta aparadas, possua 3 canais (BGR)
+    e tipo uint8 para entrada no YOLOv8-cls.
+    """
+    if trim_border:
+        cell_crop = _trim_cell_gap_margins(cell_crop)
     if cell_crop.dtype != np.uint8:
         cell_crop = np.clip(cell_crop, 0, 255).astype(np.uint8)
     if len(cell_crop.shape) == 2:
@@ -1377,10 +1407,34 @@ def evaluate_module(
     segmented_cells = segment_panel_cells(rectified, y_bounds=y_bounds, x_bounds=x_bounds)
 
     if yolo_model is not None and segmented_cells:
-        batch_preds = classify_cells_batch_yolo(
+        raw_yolo_preds = classify_cells_batch_yolo(
             [item["image"] for item in segmented_cells],
             model=yolo_model
         )
+        batch_preds = []
+        for item, (y_def, y_type, y_conf) in zip(segmented_cells, raw_yolo_preds):
+            cell_img = item["image"]
+            h_def, h_type, h_conf = inspect_cell_region(cell_img, module_median_int, module_std_int)
+            inner = _trim_cell_gap_margins(cell_img, trim_ratio=0.10)
+            c_mean = float(np.mean(inner)) if inner.size > 0 else float(np.mean(cell_img))
+            c_std = float(np.std(inner)) if inner.size > 0 else float(np.std(cell_img))
+            rel_b = c_mean / max(module_median_int, 20.0)
+
+            if y_def:
+                # Cross-validate with radiometric & gradient consistency to suppress false alarms
+                # caused by perspective warp interpolation, half-cut aspect ratios, or borderline scores
+                if not h_def and c_std < 10.5 and (0.85 <= rel_b <= 1.15):
+                    batch_preds.append((False, DefectType.NONE, h_conf))
+                elif not h_def and y_conf < 0.78 and (0.88 <= rel_b <= 1.12):
+                    batch_preds.append((False, DefectType.NONE, h_conf))
+                else:
+                    batch_preds.append((True, y_type, y_conf))
+            else:
+                # Recover severe physical defects (completely dead cell or synthetic defect)
+                if h_def and (h_type == DefectType.DEAD or (c_std < 17.5 and h_conf >= 0.65)):
+                    batch_preds.append((True, DefectType.DEFEITUOSA, h_conf))
+                else:
+                    batch_preds.append((False, DefectType.NONE, y_conf))
     else:
         batch_preds = [
             inspect_cell_region(item["image"], module_median_int, module_std_int)
