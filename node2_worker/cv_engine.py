@@ -327,22 +327,23 @@ def _is_quad_already_orthogonal_full_frame(
     img_shape: Tuple[int, int]
 ) -> bool:
     """
-    Checks whether a detected 4-point quadrilateral already occupies the full frame
-    in an upright, orthogonal orientation (no significant rotation or trapezoidal skew).
+    Checks whether a detected 4-point quadrilateral already occupies the frame
+    in an upright, orthogonal orientation (no significant rotation or trapezoidal skew),
+    including external bench captures with a uniform dark perimeter border.
     """
     h, w = img_shape[:2]
     tl, tr, br, bl = ordered_quad
 
-    margin_thresh = max(35.0, float(min(w, h)) * 0.08)
+    margin_thresh = max(48.0, float(max(w, h)) * 0.10)
     corners_near_frame = (
-        tl[0] <= margin_thresh
-        and tl[1] <= margin_thresh
-        and (w - tr[0]) <= margin_thresh
-        and tr[1] <= margin_thresh
-        and (w - br[0]) <= margin_thresh
-        and (h - br[1]) <= margin_thresh
-        and bl[0] <= margin_thresh
-        and (h - bl[1]) <= margin_thresh
+        -4.0 <= tl[0] <= margin_thresh
+        and -4.0 <= tl[1] <= margin_thresh
+        and -4.0 <= (w - tr[0]) <= margin_thresh
+        and -4.0 <= tr[1] <= margin_thresh
+        and -4.0 <= (w - br[0]) <= margin_thresh
+        and -4.0 <= (h - br[1]) <= margin_thresh
+        and -4.0 <= bl[0] <= margin_thresh
+        and -4.0 <= (h - bl[1]) <= margin_thresh
     )
     if not corners_near_frame:
         return False
@@ -353,7 +354,7 @@ def _is_quad_already_orthogonal_full_frame(
     left_angle = abs(math.degrees(math.atan2(float(bl[1] - tl[1]), float(bl[0] - tl[0]))) - 90.0)
     right_angle = abs(math.degrees(math.atan2(float(br[1] - tr[1]), float(br[0] - tr[0]))) - 90.0)
 
-    if max(top_angle, bot_angle, left_angle, right_angle) > 0.65:
+    if max(top_angle, bot_angle, left_angle, right_angle) > 1.0:
         return False
 
     # Check trapezoidal length symmetry
@@ -362,7 +363,7 @@ def _is_quad_already_orthogonal_full_frame(
     h_left = float(np.linalg.norm(bl - tl))
     h_right = float(np.linalg.norm(br - tr))
 
-    if abs(w_top - w_bot) > max(6.0, 0.015 * w) or abs(h_left - h_right) > max(6.0, 0.015 * h):
+    if abs(w_top - w_bot) > max(8.0, 0.018 * w) or abs(h_left - h_right) > max(8.0, 0.018 * h):
         return False
 
     return True
@@ -372,11 +373,12 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
     """
     Robustly detects the 4 outer corners [TL, TR, BR, BL] of the PV module using:
     1. Local contrast normalization (CLAHE) + bilateral/Gaussian smoothing.
-    2. Dual-stage segmentation:
+    2. Multi-stage segmentation:
        - Substrate-aware foreground extraction (handles dark/dead peripheral cells
          and anodized module frames against dark test-bench backgrounds).
        - Adaptive Canny edge + CLAHE Otsu active matrix segmentation with
          morphological bridging and reflection/bench-noise suppression.
+       - Multi-Otsu active luminescent matrix isolation for external camera captures.
     3. Convex Hull + 4-side collinear line fitting & intersection to reconstruct
        missing corners caused by dead corner cells or perspective distortion.
     """
@@ -423,7 +425,6 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
     edges = cv2.Canny(blurred_clahe, canny_low, canny_high)
 
     # Combine CLAHE binary mask with internal/boundary Canny edges, suppress bench noise
-    combined_mask = cv2.bitwise_or(otsu_clahe, edges)
     cleaned_mask = cv2.morphologyEx(otsu_clahe, cv2.MORPH_OPEN, kernel_open)
     bridged_mask = cv2.morphologyEx(
         cv2.bitwise_or(cleaned_mask, edges),
@@ -463,9 +464,9 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
     if not candidate_hulls:
         return None
 
-    # Prefer the hull that yields a clean 4-line quad with largest valid area
+    # Score candidate quads: prefer clean in-bounds rectangular quads over out-of-bounds skewed hulls
     best_quad: Optional[np.ndarray] = None
-    best_area = -1.0
+    best_score = -1.0
 
     for hull in candidate_hulls:
         quad = _fit_quad_from_hull_lines(hull, (h, w))
@@ -474,8 +475,29 @@ def detect_panel_quadrilateral(gray_img: np.ndarray) -> Optional[np.ndarray]:
             quad = order_quad_points(cv2.boxPoints(rect).astype(np.float32))
 
         q_area = float(cv2.contourArea(quad.reshape(-1, 1, 2)))
-        if q_area > 0.12 * img_area and q_area > best_area:
-            best_area = q_area
+        if q_area <= 0.12 * img_area:
+            continue
+
+        # Penalize vertices that extrapolate outside the physical image canvas
+        oob_x = np.maximum(0.0, -quad[:, 0]) + np.maximum(0.0, quad[:, 0] - (w - 1))
+        oob_y = np.maximum(0.0, -quad[:, 1]) + np.maximum(0.0, quad[:, 1] - (h - 1))
+        max_oob = float(np.max(oob_x + oob_y))
+        oob_factor = 1.0 if max_oob <= 4.0 else max(0.35, 1.0 - (max_oob / float(max(w, h))) * 6.0)
+
+        tl, tr, br, bl = quad
+        w_top = float(np.linalg.norm(tr - tl))
+        w_bot = float(np.linalg.norm(br - bl))
+        h_left = float(np.linalg.norm(bl - tl))
+        h_right = float(np.linalg.norm(br - tr))
+        sym_err = (
+            abs(w_top - w_bot) / max(w_top, w_bot, 1.0)
+            + abs(h_left - h_right) / max(h_left, h_right, 1.0)
+        )
+        sym_factor = max(0.5, 1.0 - sym_err * 2.0)
+
+        score = q_area * oob_factor * sym_factor
+        if score > best_score:
+            best_score = score
             best_quad = quad
 
     return best_quad
@@ -506,7 +528,8 @@ def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
     normalization, Otsu/multi-Otsu active matrix isolation, Canny edge / Convex Hull
     4-line intersection, and performs homography rectification via perspective transform
     if the module is rotated or trapezoidally distorted.
-    Also applies 1%-99% Min-Max gain normalization on dark external captures.
+    Preserves native image orientation (landscape vs. portrait) and avoids warping
+    captures that are already orthogonal.
     """
     if gray_img is None or gray_img.size == 0:
         raise ValueError("Input image to normalize_perspective is empty.")
@@ -525,7 +548,7 @@ def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
     if ordered is None:
         return gray_img
 
-    # Preserve original raster if already orthogonal and full-frame
+    # Preserve original raster if already orthogonal (including upright bench captures)
     if _is_quad_already_orthogonal_full_frame(ordered, (h, w)):
         return gray_img
 
@@ -538,6 +561,18 @@ def normalize_perspective(gray_img: np.ndarray) -> np.ndarray:
     height_a = float(np.linalg.norm(tr - br))
     height_b = float(np.linalg.norm(tl - bl))
     max_h = int(round(max(height_a, height_b)))
+
+    # Preserve native landscape/portrait orientation: never rotate a clearly horizontal
+    # capture into vertical (or vice-versa) during perspective rectification
+    if (w > h * 1.15 and max_h > max_w * 1.15) or (h > w * 1.15 and max_w > max_h * 1.15):
+        ordered = np.roll(ordered, -1, axis=0)
+        tl, tr, br, bl = ordered
+        width_a = float(np.linalg.norm(br - bl))
+        width_b = float(np.linalg.norm(tr - tl))
+        max_w = int(round(max(width_a, width_b)))
+        height_a = float(np.linalg.norm(tr - br))
+        height_b = float(np.linalg.norm(tl - bl))
+        max_h = int(round(max(height_a, height_b)))
 
     if max_w > 100 and max_h > 100:
         dst = np.array([
@@ -658,10 +693,13 @@ def _detect_1d_dividers(
 
     combined = 0.45 * norm_g + 0.55 * norm_v
 
-    default_max_cells = 26 if axis == 1 else 17
-    min_dist = max(20 if axis == 1 else 35, length // default_max_cells)
-    peaks, _ = find_peaks(combined, distance=min_dist, prominence=0.08)
-    margin = int(length * 0.035)
+    is_wide_axis = (axis == 0 and active_sub.shape[1] >= active_sub.shape[0]) or (
+        axis == 1 and active_sub.shape[0] > active_sub.shape[1]
+    )
+    default_max_cells = 28 if is_wide_axis else 17
+    min_dist = max(18 if is_wide_axis else 30, length // default_max_cells)
+    peaks, _ = find_peaks(combined, distance=min_dist, prominence=0.06 if is_wide_axis else 0.08)
+    margin = int(length * (0.025 if is_wide_axis else 0.035))
     # Require that any valid divider is a genuine dark valley in the P80 profile
     # (rejects thin internal cell fingers and single-cell half-dark grid faults)
     raw_divs = [
@@ -954,12 +992,31 @@ def segment_panel_cells(
             dark_th = float(np.min(prof_y) + 0.35 * np.ptp(prof_y))
             dark_idx = np.where(prof_y <= dark_th)[0]
             if len(dark_idx) >= 10:
-                # Wide central half-cut gap detected
+                # Wide central half-cut gap detected along Y
                 half_gap = max(0, (int(dark_idx[-1] - dark_idx[0]) - 4) // 2)
                 cell_h_above = y_bounds[mid_r] - y_bounds[mid_r - 1]
                 cell_h_below = y_bounds[mid_r + 1] - y_bounds[mid_r]
                 y_trim_bot[mid_r - 1] = min(half_gap, int(cell_h_above * 0.22))
                 y_trim_top[mid_r] = min(half_gap, int(cell_h_below * 0.22))
+
+    x_trim_left = [0] * cols
+    x_trim_right = [0] * cols
+    if cols >= 10 and cols % 2 == 0:
+        mid_c = cols // 2
+        center_div_x = x_bounds[mid_c]
+        band_x0 = max(0, center_div_x - 25)
+        band_x1 = min(rectified_img.shape[1], center_div_x + 25)
+        prof_x = np.mean(rectified_img[y_bounds[0]:y_bounds[-1], band_x0:band_x1], axis=0)
+        if prof_x.size > 0:
+            dark_th_x = float(np.min(prof_x) + 0.45 * np.ptp(prof_x))
+            dark_idx_x = np.where(prof_x <= dark_th_x)[0]
+            if len(dark_idx_x) >= 6:
+                # Wide central half-cut gap detected along X (e.g. 6x20 or 6x24 landscape)
+                half_gap_x = max(0, (int(dark_idx_x[-1] - dark_idx_x[0]) - 2) // 2)
+                cell_w_left = x_bounds[mid_c] - x_bounds[mid_c - 1]
+                cell_w_right = x_bounds[mid_c + 1] - x_bounds[mid_c]
+                x_trim_right[mid_c - 1] = min(half_gap_x, int(cell_w_left * 0.22))
+                x_trim_left[mid_c] = min(half_gap_x, int(cell_w_right * 0.22))
 
     segmented_cells: List[Dict[str, Any]] = []
     for r in range(rows):
@@ -969,8 +1026,10 @@ def segment_panel_cells(
             y0, y1 = int(y_bounds[r]), int(y_bounds[r + 1])
 
         for c in range(cols):
-            x0 = int(x_bounds[c])
-            x1 = int(x_bounds[c + 1])
+            x0 = int(x_bounds[c] + x_trim_left[c])
+            x1 = int(x_bounds[c + 1] - x_trim_right[c])
+            if x1 <= x0:
+                x0, x1 = int(x_bounds[c]), int(x_bounds[c + 1])
             cell_id = r * cols + c
             w = int(x1 - x0)
             h = int(y1 - y0)
@@ -1173,8 +1232,9 @@ def resolve_model_path(weights_path: Optional[str] = None) -> str:
 
 def get_model_sha256(weights_path: Optional[str] = None) -> str:
     """
-    Calcula e mantém em cache o hash SHA-256 do arquivo de pesos 'best.pt'
-    para verificação de integridade e consistência entre workers distribuídos.
+    Calcula e mantém em cache o hash SHA-256 combinado do arquivo de pesos 'best.pt'
+    e da revisão do motor de visão computacional ('cv_engine.py') para verificação
+    de integridade e invalidação automática de cache entre workers distribuídos.
     """
     global _MODEL_SHA256
     if _MODEL_SHA256 is not None and weights_path is None:
@@ -1186,6 +1246,11 @@ def get_model_sha256(weights_path: Optional[str] = None) -> str:
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
                 sha.update(chunk)
+        # Inclui o código do pipeline CV para invalidar automaticamente caches Redis antigos quando a calibração mudar
+        try:
+            sha.update(Path(__file__).resolve().read_bytes())
+        except Exception:
+            pass
         digest = sha.hexdigest()
         if weights_path is None:
             _MODEL_SHA256 = digest
@@ -1539,6 +1604,7 @@ def evaluate_module(
                 for it in segmented_cells
             ]
             median_cell_std = float(np.median(inner_stds)) if inner_stds else 15.0
+            std_clean_limit = max(9.5, median_cell_std * 1.32)
 
             batch_preds = []
             for item, (y_def, y_type, y_conf) in zip(segmented_cells, raw_yolo_preds):
@@ -1548,11 +1614,16 @@ def evaluate_module(
                 c_mean = float(np.mean(inner)) if inner.size > 0 else float(np.mean(cell_img))
                 c_std = float(np.std(inner)) if inner.size > 0 else float(np.std(cell_img))
                 rel_b = c_mean / max(module_median_int, 20.0)
+                if inner.size > 0:
+                    p2, p50 = np.percentile(inner, [2, 50])
+                    drop_p2 = float(p50 - p2) / max(float(p50), 1.0)
+                else:
+                    drop_p2 = 0.0
 
                 if y_def:
                     # Cross-validate with radiometric & gradient consistency to suppress false alarms
                     # caused by perspective warp interpolation, half-cut aspect ratios, or borderline scores
-                    if not h_def and c_std < 9.5 and (0.87 <= rel_b <= 1.13):
+                    if not h_def and c_std < std_clean_limit and drop_p2 < 0.29 and (0.85 <= rel_b <= 1.15):
                         batch_preds.append((False, DefectType.NONE, h_conf))
                     elif not h_def and y_conf < 0.72 and (0.90 <= rel_b <= 1.10):
                         batch_preds.append((False, DefectType.NONE, h_conf))

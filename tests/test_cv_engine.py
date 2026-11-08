@@ -591,6 +591,27 @@ class TestCVEngine(unittest.TestCase):
         self.assertIn(res_good.module_damage_percentage, (0.0, 100.0))
         self.assertEqual(res_good.status, "FAIL" if res_good.defective_cells_count == 1 else "PASS")
 
+    def test_half_cut_6x24_landscape_module_with_central_busbar(self):
+        """
+        Verify that a landscape 6x24 Half-Cut EL module (144 half-cells divided by a thick
+        central vertical busbar) preserves its native landscape orientation, detects the exact
+        6x24 grid, and marks only genuinely cracked cells instead of the entire panel.
+        """
+        webp_path = self.fixtures_dir / "Electroluminescence+(EL)+Testing+for+PV+Modules.webp"
+        if not webp_path.is_file():
+            self.skipTest("6x24 WebP fixture not present.")
+        with open(webp_path, "rb") as f:
+            raw_bytes = f.read()
+
+        res = evaluate_module(raw_bytes, filename=webp_path.name, use_yolo=True)
+        self.assertEqual(res.rows, 6)
+        self.assertEqual(res.cols, 24)
+        self.assertEqual(res.total_cells, 144)
+        self.assertGreater(res.image_width, res.image_height)
+        self.assertEqual(res.status, "FAIL")
+        self.assertGreaterEqual(res.defective_cells_count, 15)
+        self.assertLessEqual(res.defective_cells_count, 45)
+
 
 if __name__ == "__main__":
     unittest.main()
