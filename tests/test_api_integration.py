@@ -75,7 +75,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertTrue(meta["dns_name"].endswith(".luminapv.local"))
         self.assertEqual(meta["status"], "ONLINE")
 
-        # Verify Redis heartbeat registration with mocked Redis client
+        # Verify Redis heartbeat registration and clean shutdown (srem) with mocked Redis client
         mock_redis = AsyncMock()
         worker_module.registry.redis_client = mock_redis
         try:
@@ -83,6 +83,17 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             self.assertEqual(hb_meta["registry_backend"], "redis")
             mock_redis.set.assert_awaited_once()
             mock_redis.sadd.assert_awaited_once()
+
+            # Verify stop() removes node key and cleans node_id from Redis Set
+            asyncio.run(worker_module.registry.stop())
+            mock_redis.delete.assert_awaited_once_with(
+                f"{worker_module.REGISTRY_KEY_PREFIX}:{worker_module.registry.node_id}"
+            )
+            mock_redis.srem.assert_awaited_once_with(
+                f"{worker_module.REGISTRY_KEY_PREFIX}:nodes",
+                worker_module.registry.node_id,
+            )
+            mock_redis.close.assert_awaited_once()
         finally:
             worker_module.registry.redis_client = None
 
@@ -156,6 +167,89 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertTrue(stats["model_consistent"])
         self.assertGreaterEqual(stats["total_replicated_modules"], 1)
         self.assertGreaterEqual(stats["cache_hits"], 1)
+
+    def test_worker_local_lru_replica_store_capacity_eviction(self):
+        """Local LRUReplicaStore evicts least recently used items when capacity is exceeded."""
+        lru = worker_module.LRUReplicaStore(max_size=3)
+        lru["hash_1"] = {"id": 1}
+        lru["hash_2"] = {"id": 2}
+        lru["hash_3"] = {"id": 3}
+        self.assertEqual(len(lru), 3)
+
+        # Access hash_1 so it becomes most recently used (hash_2 becomes oldest)
+        _ = lru.get("hash_1")
+
+        # Insert hash_4 -> should evict hash_2
+        lru["hash_4"] = {"id": 4}
+        self.assertEqual(len(lru), 3)
+        self.assertNotIn("hash_2", lru)
+        self.assertIn("hash_1", lru)
+        self.assertIn("hash_3", lru)
+        self.assertIn("hash_4", lru)
+
+    def test_worker_cache_invalid_schema_degrades_to_cache_miss(self):
+        """get_cached_result safely degrades to cache miss when cached payload has incompatible schema."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            raw_bytes = f.read()
+
+        import hashlib
+        content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        content_key = f"{content_sha256}:yolo=0"
+
+        # Inject corrupted/incompatible schema payload into local replica store
+        worker_module._LOCAL_REPLICA_STORE[content_key] = {
+            "filename": "corrupted_schema.png",
+            "model_sha256": worker_module.get_model_sha256(),
+            "rows": "invalid_type_not_an_int",
+            # missing required fields like cols, total_cells, status, etc.
+        }
+
+        misses_before = worker_module.replicator.cache_misses
+        cached = asyncio.run(
+            worker_module.replicator.get_cached_result(
+                raw_bytes,
+                filename="scan_module_6x10_pass.png",
+                use_yolo=False,
+            )
+        )
+        self.assertIsNone(cached)
+        self.assertEqual(worker_module.replicator.cache_misses, misses_before + 1)
+        self.assertNotIn(content_key, worker_module._LOCAL_REPLICA_STORE)
+
+        # Full endpoint request should recompute cleanly (HTTP 200) after schema cache miss
+        worker_module._LOCAL_REPLICA_STORE[content_key] = {
+            "filename": "corrupted_schema.png",
+            "model_sha256": worker_module.get_model_sha256(),
+        }
+        res = self.worker_client.post(
+            "/api/v1/process-module?use_yolo=false&use_cache=true",
+            files={"file": ("scan_module_6x10_pass.png", raw_bytes, "image/png")},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertFalse(data["cache_hit"])
+        self.assertTrue(data["replicated"])
+
+    def test_worker_replication_stats_purges_expired_redis_hashes(self):
+        """get_replication_stats purges expired hashes from REPLICA_INDEX_KEY in Redis."""
+        worker_module._LOCAL_REPLICA_STORE.clear()
+        mock_redis = AsyncMock()
+        mock_redis.get.return_value = worker_module.get_model_sha256()
+        mock_redis.smembers.return_value = {"valid_hash_aaa", "expired_hash_bbb"}
+        mock_redis.exists.side_effect = lambda key: 1 if "valid_hash_aaa" in key else 0
+
+        worker_module.registry.redis_client = mock_redis
+        try:
+            stats = asyncio.run(worker_module.replicator.get_replication_stats())
+            self.assertEqual(stats["total_replicated_modules"], 1)
+            self.assertEqual(stats["replicated_keys"], ["valid_hash_aaa"])
+            mock_redis.srem.assert_awaited_once_with(
+                worker_module.REPLICA_INDEX_KEY, "expired_hash_bbb"
+            )
+        finally:
+            worker_module.registry.redis_client = None
 
     def test_worker_corrupted_image_returns_422(self):
         """Worker returns HTTP 422 with structured detail when image is corrupt."""
