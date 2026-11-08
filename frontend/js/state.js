@@ -47,24 +47,24 @@ var state = {
 
 /* ---------- formatting & string helpers ---------- */
 function nf(n, d) {
-  if (n === null || n === undefined || !isFinite(n)) return "—";
+  if (n === null || n === undefined || !isFinite(n)) return "--";
   return Number(n).toFixed(d === undefined ? 1 : d).replace(".", ",");
 }
 
 function pct(n, d) {
-  if (n === null || n === undefined || !isFinite(n)) return "—";
+  if (n === null || n === undefined || !isFinite(n)) return "--";
   return nf(n, d) + "%";
 }
 
 function confPct(val, d) {
-  if (val === null || val === undefined || !isFinite(val)) return "—";
+  if (val === null || val === undefined || !isFinite(val)) return "--";
   var num = +val;
   var scaled = (num > 0 && num <= 1.0) ? (num * 100.0) : num;
   return pct(scaled, d === undefined ? 1 : d);
 }
 
 function int(n) {
-  if (n === null || n === undefined || !isFinite(n)) return "—";
+  if (n === null || n === undefined || !isFinite(n)) return "--";
   return new Intl.NumberFormat("pt-BR").format(n);
 }
 
@@ -160,9 +160,9 @@ function defects(m) {
 }
 
 function severity(m) {
-  if (!m) return { key: "—", cls: "", label: "—" };
+  if (!m) return { key: "--", cls: "", label: "--" };
   var d = +m.module_damage_percentage;
-  if (!isFinite(d)) return { key: "—", cls: "", label: "—" };
+  if (!isFinite(d)) return { key: "--", cls: "", label: "--" };
   if (d >= 15) return { key: "CRITICO", cls: "critical", label: "CRÍTICO" };
   if (d >= 5) return { key: "DEGRADADO", cls: "degraded", label: "DEGRADADO" };
   return { key: "NOMINAL", cls: "nominal", label: "NOMINAL" };

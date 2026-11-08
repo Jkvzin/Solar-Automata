@@ -24,7 +24,7 @@ var DEFECT_LABEL = {
   "delamination": "DELAMINAÇÃO",
   "grid-fault": "FALHA DE GRADE",
   "defeituosa": "DEFEITUOSA",
-  "none": "—"
+  "none": "--"
 };
 
 var DEFECT_VAR = {

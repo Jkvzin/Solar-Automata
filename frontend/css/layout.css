@@ -31,8 +31,11 @@
   color: var(--accent);
 }
 
-.brand b {
+.brand b,
+.brand .brand-title {
+  margin: 0;
   font-size: 13px;
+  font-weight: 700;
   color: var(--fg-strong);
   letter-spacing: 0.01em;
   white-space: nowrap;
@@ -110,6 +113,16 @@
 
 .metric-v.is-pass {
   color: var(--pass);
+}
+
+.metric[data-od-id="metric-failure"]:has(.is-fail) {
+  border-top: 2px solid var(--defect);
+  padding-top: 7px;
+}
+
+.metric[data-od-id="metric-failure"]:has(.is-pass) {
+  border-top: 2px solid var(--pass);
+  padding-top: 7px;
 }
 
 .mbar {
@@ -368,6 +381,43 @@
     flex: none;
     padding: 6px 10px;
     gap: 6px;
+  }
+  .btn,
+  .seg button,
+  .viewtools button,
+  .dock-tabs button,
+  .auth-tabs button,
+  .history-load-btn,
+  .history-del-btn {
+    min-height: 44px;
+  }
+  .btn-icon,
+  .history-del-btn {
+    min-width: 44px;
+  }
+  .pane-explorer .pane-head #clearBatchBtn {
+    height: auto !important;
+    min-height: 44px;
+    padding: 0 10px !important;
+  }
+  .pane-head {
+    height: auto;
+    min-height: 44px;
+    flex-wrap: wrap;
+    padding: 4px 8px;
+  }
+  .dock-head {
+    height: auto;
+    min-height: 44px;
+    flex-wrap: wrap;
+  }
+  .dock-tabs {
+    height: auto;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .mod {
+    min-height: 44px;
   }
   .statusbar {
     flex-wrap: nowrap;

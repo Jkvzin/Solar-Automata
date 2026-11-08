@@ -143,6 +143,22 @@ body {
 button {
   font: inherit;
   color: inherit;
+  cursor: pointer;
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+a,
+[role="button"],
+[role="tab"],
+[role="option"],
+label[for] {
+  cursor: pointer;
 }
 
 ::-webkit-scrollbar {

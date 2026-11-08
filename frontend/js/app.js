@@ -326,6 +326,13 @@ function initEvents() {
   var exportBtn = $("#exportBtn");
   if (exportBtn) exportBtn.addEventListener("click", exportCsv);
 
+  var clearBatchBtn = $("#clearBatchBtn");
+  if (clearBatchBtn) {
+    clearBatchBtn.addEventListener("click", function() {
+      if (typeof clearLocalBatch === "function") clearLocalBatch();
+    });
+  }
+
   var distChart = $("#distChart");
   if (distChart) {
     distChart.addEventListener("mousemove", function(e) {
@@ -370,8 +377,29 @@ function initEvents() {
   }
 
   document.addEventListener("keydown", function(e) {
+    var authBg = $("#authModalBackdrop");
+    if (authBg && !authBg.hidden && e.key === "Tab") {
+      var modal = $("#authModal");
+      if (modal) {
+        var focusable = $$('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])', modal).filter(function(el) {
+          return !el.closest("[hidden]") && el.offsetParent !== null;
+        });
+        if (focusable.length) {
+          var first = focusable[0];
+          var last = focusable[focusable.length - 1];
+          if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+            return;
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+            return;
+          }
+        }
+      }
+    }
     if (e.key === "Escape") {
-      var authBg = $("#authModalBackdrop");
       if (authBg && !authBg.hidden) {
         closeAuthModal();
         return;
@@ -542,7 +570,7 @@ function boot() {
   renderAll();
   if (typeof authVerifySession === "function") authVerifySession();
   var sbH = $("#sbHttp");
-  if (sbH) sbH.textContent = "HTTP —";
+  if (sbH) sbH.textContent = "HTTP --";
   setStatusBar("idle");
 
   // Inicia polling de telemetria e coordenação do cluster em tempo real

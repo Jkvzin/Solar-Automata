@@ -14,7 +14,7 @@
 <header class="topbar" data-od-id="topbar">
   <div class="brand">
     <span class="mark" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square"><path d="M4 6h16M4 12h10M4 18h14"/></svg></span>
-    <b>LuminaPV</b>
+    <h1 class="brand-title">LuminaPV</h1>
     <span class="env">CONSOLE EL <b>·</b> QA ÓPTICO</span>
   </div>
   <span class="spacer"></span>
@@ -41,34 +41,35 @@
 <section class="metrics" aria-label="Telemetria global do lote" data-od-id="batch-metrics">
   <div class="metric" data-od-id="metric-inspected">
     <div class="sec-label">Total inspecionado</div>
-    <div class="metric-v" id="mInspected">—</div>
+    <div class="metric-v" id="mInspected">--</div>
     <div class="metric-sub" id="mInspectedSub">aguardando lote</div>
   </div>
   <div class="metric" data-od-id="metric-failure">
     <div class="sec-label">Módulos com falha</div>
-    <div class="metric-v" id="mFailure">—</div>
+    <div class="metric-v" id="mFailure">--</div>
     <div class="metric-sub" id="mFailureSub">aguardando lote</div>
   </div>
   <div class="metric" data-od-id="metric-cells">
     <div class="sec-label">Células defeituosas</div>
-    <div class="metric-v" id="mCells">—</div>
+    <div class="metric-v" id="mCells">--</div>
     <div class="metric-sub" id="mCellsSub">aguardando lote</div>
   </div>
   <div class="metric" data-od-id="metric-degradation">
     <div class="sec-label">Degradação média</div>
-    <div class="metric-v" id="mDegr">—</div>
+    <div class="metric-v" id="mDegr">--</div>
     <div class="metric-sub" id="mDegrSub">perda média de área por célula</div>
   </div>
   <div class="mbar" aria-hidden="true"><i id="globalBar"></i></div>
 </section>
 
-<div class="workspace">
+<main class="workspace">
 
   <aside class="pane pane-explorer" data-od-id="pane-explorer" aria-label="Explorador de lotes">
     <div class="pane-head">
       <span class="sec-label">Explorador de lotes</span>
       <span class="spacer"></span>
       <span class="mono" style="font-size:10.5px;color:var(--muted2)" id="treeCount">0</span>
+      <button class="btn" id="clearBatchBtn" type="button" disabled title="Limpar módulos da sessão atual" style="height:20px;padding:0 6px;font-size:10px">Limpar</button>
     </div>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Selecionar capturas de eletroluminescência para análise">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" aria-hidden="true"><path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v3h16v-3"/></svg>
@@ -92,8 +93,8 @@
     <div class="pane-head">
       <span class="sec-label">Inspeção óptica · eletroluminescência</span>
       <span class="spacer"></span>
-      <span class="mono" id="vpFile" style="font-size:10.5px;color:var(--muted2)">—</span>
-      <span class="mono" id="vpGrid" style="font-size:10.5px;color:var(--muted2)">GRADE —</span>
+      <span class="mono" id="vpFile" style="font-size:10.5px;color:var(--muted2)">--</span>
+      <span class="mono" id="vpGrid" style="font-size:10.5px;color:var(--muted2)">GRADE --</span>
       <span id="vpStatus"></span>
     </div>
     <div class="stage" id="stage">
@@ -132,28 +133,28 @@
         <div class="tele-grid">
           <div class="tele">
             <div class="tele-k">Índice de dano</div>
-            <div class="damage ok" id="insDamage">—</div>
+            <div class="damage ok" id="insDamage">--</div>
           </div>
           <div class="tele">
             <div class="tele-k">Células defeituosas</div>
-            <div class="tele-v" id="insTally">—</div>
-            <div class="tele-v" style="font-size:10.5px;color:var(--muted2)" id="insGrid">grade —</div>
+            <div class="tele-v" id="insTally">--</div>
+            <div class="tele-v" style="font-size:10.5px;color:var(--muted2)" id="insGrid">grade --</div>
           </div>
           <div class="tele">
             <div class="tele-k">Tipo predominante</div>
-            <div class="tele-v" style="font-size:12.5px" id="insDominant">—</div>
+            <div class="tele-v" style="font-size:12.5px" id="insDominant">--</div>
           </div>
           <div class="tele">
             <div class="tele-k">Confiança média</div>
-            <div class="tele-v" id="insConf">—</div>
+            <div class="tele-v" id="insConf">--</div>
           </div>
           <div class="tele">
             <div class="tele-k">Nó processador</div>
-            <div class="tele-v" style="font-size:11.5px" id="insNode">—</div>
+            <div class="tele-v" style="font-size:11.5px" id="insNode">--</div>
           </div>
           <div class="tele">
             <div class="tele-k">Replicação & IA</div>
-            <div class="tele-v" style="font-size:11px" id="insRep">—</div>
+            <div class="tele-v" style="font-size:11px" id="insRep">--</div>
           </div>
         </div>
       </div>
@@ -210,8 +211,8 @@
           <div class="topo-summary" id="topoSummary">
             <div class="topo-card">
               <span class="topo-card-title">Líder Eleito</span>
-              <div class="topo-card-val"><span class="tag-leader" id="topoLeaderBadge">LEADER</span> <span id="topoLeaderId">—</span></div>
-              <span class="topo-card-sub" id="topoLeaderTerm">Termo — · Concessão Ativa</span>
+              <div class="topo-card-val"><span class="tag-leader" id="topoLeaderBadge">LEADER</span> <span id="topoLeaderId">--</span></div>
+              <span class="topo-card-sub" id="topoLeaderTerm">Termo -- · Concessão Ativa</span>
             </div>
             <div class="topo-card">
               <span class="topo-card-title">Esquema de Nomeação</span>
@@ -258,7 +259,7 @@
           <div class="history-toolbar">
             <span class="sec-label" id="historyStatusLabel">Minhas análises · Partição S3 por operador</span>
             <span class="spacer"></span>
-            <span class="mono" style="font-size:10px;color:var(--muted2)" id="historyPrefixBadge">s3://.../users/—</span>
+            <span class="mono" style="font-size:10px;color:var(--muted2)" id="historyPrefixBadge">s3://.../users/--</span>
             <button type="button" class="btn" id="historyRefreshBtn" title="Sincronizar histórico de análises do S3">Atualizar histórico</button>
           </div>
           <div class="history-grid" id="historyGrid" role="list" aria-label="Galeria de análises anteriores do operador"></div>
@@ -269,21 +270,21 @@
       </div>
     </div>
   </section>
-</div>
+</main>
 
 <footer class="statusbar" data-od-id="statusbar">
   <span class="sb"><span class="dot" id="sbDot"></span><span class="mono" id="sbState">PRONTO</span></span>
   <span class="sb-sep" aria-hidden="true"></span>
-  <span class="sb mono" id="sbCluster" title="Topologia e nós do cluster"><span class="tag-leader" id="sbLeaderBadge">LÍDER: —</span> <span id="sbClusterNodes">— NÓS</span></span>
+  <span class="sb mono" id="sbCluster" title="Topologia e nós do cluster"><span class="tag-leader" id="sbLeaderBadge">LÍDER: --</span> <span id="sbClusterNodes">-- NÓS</span></span>
   <span class="sb-sep" aria-hidden="true"></span>
   <span class="sb mono" id="sbConsistency" title="Modelo de consistência ativo">CONSISTÊNCIA: RYW</span>
   <span class="sb-sep" aria-hidden="true"></span>
   <span class="sb mono" id="sbEndpoint">POST /api/v1/analyze/bulk</span>
-  <span class="sb mono" id="sbHttp">HTTP —</span>
+  <span class="sb mono" id="sbHttp">HTTP --</span>
   <span class="spacer"></span>
-  <span class="sb mono" id="sbBatch">LOTE —</span>
+  <span class="sb mono" id="sbBatch">LOTE --</span>
   <span class="sb-sep" aria-hidden="true"></span>
-  <span class="sb mono" id="sbActive">MÓDULO —</span>
+  <span class="sb mono" id="sbActive">MÓDULO --</span>
   <span class="sb-sep" aria-hidden="true"></span>
   <span class="sb mono" id="sbKeys">↑↓ NAVEGAR · ENTER SELECIONAR · ESC FECHAR ZOOM</span>
 </footer>

@@ -26,27 +26,27 @@ function describeHttp(status, body) {
   if (status === 400 || status === 415 || status === 422) {
     return {
       title: "Lote rejeitado pela API",
-      detail: "HTTP " + status + " — a API recusou o envio: " + (body ? String(body).slice(0, 240) : "sem detalhe na resposta") + ". Verifique formato e resolução das capturas.",
+      detail: "HTTP " + status + " - a API recusou o envio: " + (body ? String(body).slice(0, 240) : "sem detalhe na resposta") + ". Verifique formato e resolução das capturas.",
       retriable: true
     };
   }
   if (status === 401 || status === 403) {
     return {
       title: "Acesso negado pelo serviço de análise",
-      detail: "HTTP " + status + " — a credencial da sessão não autoriza o envio do lote. Renove o acesso e tente novamente.",
+      detail: "HTTP " + status + " - a credencial da sessão não autoriza o envio do lote. Renove o acesso e tente novamente.",
       retriable: false
     };
   }
   if (status >= 500) {
     return {
       title: "Falha no serviço de análise",
-      detail: "HTTP " + status + ". O lote foi preservado em memória — tente novamente; se persistir, acione o suporte.",
+      detail: "HTTP " + status + ". O lote foi preservado em memória. Tente novamente; se persistir, acione o suporte.",
       retriable: true
     };
   }
   return {
     title: "Resposta inesperada da API",
-    detail: "HTTP " + status + " em " + API_ENDPOINT + ". O lote foi preservado — tente novamente.",
+    detail: "HTTP " + status + " em " + API_ENDPOINT + ". O lote foi preservado. Tente novamente.",
     retriable: true
   };
 }
@@ -56,10 +56,10 @@ function setError(err) {
   state.lastAttempt = now();
   state.lastError = err;
   state.loading = false;
-  log("error", err.title + " — " + err.detail + " · ID " + state.errorId);
+  log("error", err.title + ": " + err.detail + " · ID " + state.errorId);
   renderErrorState(err);
   renderMetrics();
-  setStatusBar("erro", err.status || "—");
+  setStatusBar("erro", err.status || "--");
   live("Falha na análise: " + err.title);
 }
 
@@ -111,6 +111,25 @@ function loadLocalModules() {
     }
   } catch (e) {}
   return false;
+}
+
+function clearLocalBatch() {
+  if (!state.modules.length || state.loading) return;
+  var count = state.modules.length;
+  state.modules = [];
+  state.summary = null;
+  state.data = null;
+  state.activeId = null;
+  state.selectedCell = null;
+  state.files = [];
+  state.pendingFiles = [];
+  state.errorId = null;
+  if (typeof LOCAL_MODULES_KEY !== "undefined") {
+    try { localStorage.removeItem(LOCAL_MODULES_KEY); } catch (e) {}
+  }
+  log("info", "Sessão local limpa pelo operador (" + count + " módulo(s) removido(s) da tela)");
+  live("Lista de módulos limpa.");
+  if (typeof renderAll === "function") renderAll();
 }
 
 function ingestPayload(data, source, opts) {
@@ -254,7 +273,7 @@ function postBulk(files) {
 
   return doFetch(body, headers).catch(function(e) {
     if (body !== fd) {
-      log("info", "Streaming de upload não suportado pelo navegador — enviando via FormData direto");
+      log("info", "Streaming de upload não suportado pelo navegador - enviando via FormData direto");
       onUpload(1);
       return doFetch(fd, undefined);
     }
@@ -322,7 +341,7 @@ function postBulk(files) {
     } else if (timedOut || (e && e.name === "AbortError" && !e.__cancelled)) {
       setError({
         title: "Tempo esgotado na análise",
-        detail: "A API não respondeu em " + TIMEOUT_MS / 1000 + " s e a requisição foi cancelada. O lote foi preservado em memória — tente novamente.",
+        detail: "A API não respondeu em " + TIMEOUT_MS / 1000 + " s e a requisição foi cancelada. O lote foi preservado em memória. Tente novamente.",
         retriable: true,
         status: null
       });
@@ -425,7 +444,7 @@ function loadSample() {
     if (inline) {
       try {
         var d = JSON.parse(inline.textContent);
-        log("info", "fetch de arquivo indisponível neste contexto — payload de exemplo lido do bloco de dados local");
+        log("info", "fetch de arquivo indisponível neste contexto - payload de exemplo lido do bloco de dados local");
         ingestPayload(d, "bloco de dados local");
         return;
       } catch (pe) { /* segue para o estado de erro */ }
@@ -751,7 +770,7 @@ function authVerifySession() {
     .then(function(res) {
       if (res.status === 401 || res.status === 403) {
         clearAuthSession();
-        log("info", "Sessão anterior expirada ou revogada — faça login novamente.");
+        log("info", "Sessão anterior expirada ou revogada. Faça login novamente.");
         return null;
       }
       if (!res.ok) return savedUser;
@@ -801,7 +820,7 @@ function syncAndLoadUserHistory() {
         return list;
       })
       .catch(function(err) {
-        log("warn", "Falha ao sincronizar módulos locais com S3 (" + (err && err.message ? err.message : "erro") + ") — consultando histórico S3.");
+        log("warn", "Falha ao sincronizar módulos locais com S3 (" + (err && err.message ? err.message : "erro") + ") - consultando histórico S3.");
         return fetchUserHistory(100);
       });
   } else {

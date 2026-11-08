@@ -6,9 +6,9 @@
 /* ---------- render: metrics ---------- */
 function renderMetrics() {
   var s = state.summary;
-  var has = !state.loading && !!s;
+  var has = !state.loading && !!s && state.modules.length > 0;
   var mIns = $("#mInspected");
-  if (mIns) mIns.textContent = has ? pad2(+summaryOr(s.total_modules, 0)) : "—";
+  if (mIns) mIns.textContent = has ? pad2(+summaryOr(s.total_modules, 0)) : "--";
   var mInsSub = $("#mInspectedSub");
   if (mInsSub) mInsSub.textContent = has ? "módulos no lote inspecionado" : (state.loading ? "analisando..." : "aguardando lote");
 
@@ -17,7 +17,7 @@ function renderMetrics() {
   var rate = has ? summaryOr(s.batch_failure_percentage, tm ? (dm / tm * 100) : null) : null;
   var fv = $("#mFailure");
   if (fv) {
-    fv.textContent = has ? pct(rate) : "—";
+    fv.textContent = has ? pct(rate) : "--";
     fv.className = "metric-v" + (has ? (rate > 0 ? " is-fail" : " is-pass") : "");
   }
   var mFailSub = $("#mFailureSub");
@@ -25,17 +25,20 @@ function renderMetrics() {
 
   var ct = computeCellTotals();
   var mCells = $("#mCells");
-  if (mCells) mCells.textContent = has ? int(ct.defective) : "—";
+  if (mCells) mCells.textContent = has ? int(ct.defective) : "--";
   var mCellsSub = $("#mCellsSub");
   if (mCellsSub) mCellsSub.textContent = has ? (int(ct.defective) + " de " + int(ct.total) + " células (" + pct(ct.total ? ct.defective / ct.total * 100 : 0) + ")") : (state.loading ? "analisando..." : "aguardando lote");
 
   var mDegr = $("#mDegr");
-  if (mDegr) mDegr.textContent = has ? pct(summaryOr(s.average_cell_degradation_percentage, ct.total ? ct.defective / ct.total * 100 : 0)) : "—";
+  if (mDegr) mDegr.textContent = has ? pct(summaryOr(s.average_cell_degradation_percentage, ct.total ? ct.defective / ct.total * 100 : 0)) : "--";
   var mDegrSub = $("#mDegrSub");
   if (mDegrSub) mDegrSub.textContent = has ? "perda média de área por célula" : (state.loading ? "analisando..." : "aguardando lote");
 
   var exp = $("#exportBtn");
   if (exp) exp.disabled = !has || state.loading;
+
+  var clr = $("#clearBatchBtn");
+  if (clr) clr.disabled = !state.modules.length || state.loading;
 
   var worst = 0;
   state.modules.forEach(function(m) { worst = Math.max(worst, +m.module_damage_percentage || 0); });
@@ -49,6 +52,8 @@ function renderTree() {
   if (!ul) return;
   var countEl = $("#treeCount");
   if (countEl) countEl.textContent = state.modules.length ? String(visibleModules().length) + "/" + String(state.modules.length) : "0";
+  var clr = $("#clearBatchBtn");
+  if (clr) clr.disabled = !state.modules.length || state.loading;
 
   if (!state.modules.length) {
     ul.innerHTML = '<li class="empty-mini" role="presentation" style="padding:16px 10px">Fila vazia.<br>Nenhum módulo ingerido no lote.</li>';
@@ -65,8 +70,8 @@ function renderTree() {
     var nodeTag = m.processed_by_node ? '<span class="tag-node" title="Processado por ' + esc(m.processed_by_node) + '">' + esc(m.processed_by_node) + '</span>' : '';
     var repTag = m.cache_hit ? '<span class="tag-cache" title="Inferência recuperada do cache distribuído">CACHE</span>' : (m.replicated ? '<span class="tag-rep" title="Resultado replicado com consistência Read-Your-Writes">REPLICADO</span>' : '');
     return '<li role="option" aria-selected="' + (m.module_id === state.activeId) + '" data-id="' + esc(m.module_id) + '" class="mod' + (m.module_id === state.activeId ? " is-active" : "") + '" tabindex="' + (m.module_id === state.activeId ? "0" : "-1") + '">' +
-      '<span class="mod-top"><span class="mod-name" title="' + esc(m.filename || m.module_id) + '">' + esc(m.filename || m.module_id) + '</span>' + nodeTag + repTag + tag + '</span>' +
-      '<span class="mod-meta"><span>' + esc(m.module_id) + '</span><span>' + (+m.defective_cells_count || 0) + '/' + (+m.total_cells || 0) + ' cél.</span><span>dano ' + pct(m.module_damage_percentage) + '</span></span></li>';
+      '<span class="mod-top"><span class="mod-name" title="' + esc(m.filename || m.module_id) + '">' + esc(m.filename || m.module_id) + '</span>' + tag + '</span>' +
+      '<span class="mod-meta"><span>' + esc(m.module_id) + '</span><span>' + (+m.defective_cells_count || 0) + '/' + (+m.total_cells || 0) + ' cél.</span><span>dano ' + pct(m.module_damage_percentage) + '</span>' + nodeTag + repTag + '</span></li>';
   }).join("");
 
   var act = ul.querySelector('.mod.is-active');
@@ -81,9 +86,9 @@ function renderViewport() {
   if (!stage || !plate) return;
 
   var vpFile = $("#vpFile");
-  if (vpFile) vpFile.textContent = m ? (m.filename || m.module_id) : "—";
+  if (vpFile) vpFile.textContent = m ? (m.filename || m.module_id) : "--";
   var vpGrid = $("#vpGrid");
-  if (vpGrid) vpGrid.textContent = m ? ("GRADE " + gridDims(m).rows + "×" + gridDims(m).cols) : "GRADE —";
+  if (vpGrid) vpGrid.textContent = m ? ("GRADE " + gridDims(m).rows + "×" + gridDims(m).cols) : "GRADE --";
   var vpStatus = $("#vpStatus");
   if (vpStatus) vpStatus.innerHTML = m ? (m.status === "FAIL" ? '<span class="tag tag-fail">REPROVADO</span>' : '<span class="tag tag-pass">APROVADO</span>') : "";
 
@@ -361,7 +366,7 @@ function renderViewportState() {
     host.innerHTML = '<div class="statebox">' +
       '<svg class="ico" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" aria-hidden="true"><path d="M3 4h18v16H3zM3 9h18M9 9v11"/></svg>' +
       '<h2>Nenhuma captura carregada</h2>' +
-      '<p>Ingira capturas de eletroluminescência (.png, .jpg, .tif) para o endpoint <span class="mono">' + API_ENDPOINT + '</span>. A grade de células, a matriz de coordenadas e o payload bruto só são renderizados a partir da resposta real da API — nada é simulado no cliente.</p>' +
+      '<p>Ingira capturas de eletroluminescência (.png, .jpg, .tif) para o endpoint <span class="mono">' + API_ENDPOINT + '</span>. A grade de células, a matriz de coordenadas e o payload bruto só são renderizados a partir da resposta real da API, sem simulação no cliente.</p>' +
       '<div class="acts"><button class="btn" type="button" id="emptyIngest">Ingerir lote de capturas</button><button class="linkbtn" type="button" id="emptySample">carregar payload de exemplo (.json)</button></div>' +
       '<div class="hint">POST multipart/form-data · múltipla seleção · timeout 60 s</div>' +
       '</div>';
@@ -382,7 +387,7 @@ function loadingMarkup() {
     '<div class="progwrap"><div class="prog" id="prog"><i id="progFill"></i></div>' +
     '<div class="progmeta"><span id="progPhase">UPLINK</span><span id="progPct">0%</span><span id="progTime">0,0 s</span></div></div>' +
     '<div class="acts"><button class="btn" type="button" id="cancelBtn">Cancelar</button></div>' +
-    '<div class="hint" id="slowNote" hidden>a análise está demorando mais que o esperado — o serviço ainda não respondeu</div>' +
+    '<div class="hint" id="slowNote" hidden>a análise está demorando mais que o esperado: o serviço ainda não respondeu</div>' +
     '</div>';
 }
 
@@ -400,8 +405,8 @@ function errorMarkup(err) {
     '<svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square" aria-hidden="true"><path d="M12 8v5m0 3h.01M10.3 4.3 2.6 18a1 1 0 0 0 .9 1.5h17a1 1 0 0 0 .9-1.5L13.7 4.3a1 1 0 0 0-1.7 0Z"/></svg>' +
     '<div><h3>' + esc(err.title) + '</h3><p>' + esc(err.detail) + '</p>' +
     '<div class="acts">' + acts + '</div>' +
-    (state.retries >= 3 ? '<div class="err-id">tentativas esgotadas · ' + esc(state.retries) + '/3 · acione o suporte com o ID ' + esc(state.errorId || "—") + '</div>' : '') +
-    '<div class="err-id">última tentativa ' + esc(state.lastAttempt || "—") + ' · ID ' + esc(state.errorId || "—") + ' · ' + state.pendingFiles.length + ' arquivo(s) preservados em memória</div>' +
+    (state.retries >= 3 ? '<div class="err-id">tentativas esgotadas · ' + esc(state.retries) + '/3 · acione o suporte com o ID ' + esc(state.errorId || "--") + '</div>' : '') +
+    '<div class="err-id">última tentativa ' + esc(state.lastAttempt || "--") + ' · ID ' + esc(state.errorId || "--") + ' · ' + state.pendingFiles.length + ' arquivo(s) preservados em memória</div>' +
     '</div></div></div>';
 }
 
@@ -420,7 +425,7 @@ function renderErrorState(err) {
   var cb = $("#copyErrBtn");
   if (cb) cb.addEventListener("click", function() {
     copyText(state.errorId || "");
-    log("ok", "ID do erro copiado: " + (state.errorId || "—"));
+    log("ok", "ID do erro copiado: " + (state.errorId || "--"));
   });
 
   if (state.backoffTimer) { clearInterval(state.backoffTimer); state.backoffTimer = null; }
@@ -463,16 +468,16 @@ function renderInspector() {
       dmg.textContent = pct(m.module_damage_percentage);
       dmg.className = "damage" + (isFinite(+m.module_damage_percentage) && +m.module_damage_percentage < 5 ? " ok" : "");
     } else {
-      dmg.textContent = "—";
+      dmg.textContent = "--";
       dmg.className = "damage";
     }
   }
 
   var g = m ? gridDims(m) : null;
   var insTally = $("#insTally");
-  if (insTally) insTally.innerHTML = m ? (int(+m.defective_cells_count || 0) + '<small> / ' + int(+m.total_cells || 0) + '</small>') : "—";
+  if (insTally) insTally.innerHTML = m ? (int(+m.defective_cells_count || 0) + '<small> / ' + int(+m.total_cells || 0) + '</small>') : "--";
   var insGrid = $("#insGrid");
-  if (insGrid) insGrid.textContent = m ? ("grade " + g.rows + "×" + g.cols + " · " + int(g.rows * g.cols) + " células") : "grade —";
+  if (insGrid) insGrid.textContent = m ? ("grade " + g.rows + "×" + g.cols + " · " + int(g.rows * g.cols) + " células") : "grade --";
 
   var dl = m ? defects(m) : [];
   var byType = {};
@@ -482,7 +487,7 @@ function renderInspector() {
     if (byType[k] > dc) { dc = byType[k]; dom = k; }
   });
   var insDom = $("#insDominant");
-  if (insDom) insDom.textContent = dom ? (DEFECT_LABEL[dom] || dom) : (m ? "NENHUM" : "—");
+  if (insDom) insDom.textContent = dom ? (DEFECT_LABEL[dom] || dom) : (m ? "NENHUM" : "--");
 
   var confPool = dl.length ? dl : (m && Array.isArray(m.cells) ? m.cells : []);
   var confs = confPool.map(function(c) {
@@ -490,7 +495,7 @@ function renderInspector() {
     return (v > 0 && v <= 1.0) ? (v * 100.0) : v;
   });
   var insConf = $("#insConf");
-  if (insConf) insConf.textContent = confs.length ? pct(confs.reduce(function(a, b) { return a + b; }, 0) / confs.length, 1) : "—";
+  if (insConf) insConf.textContent = confs.length ? pct(confs.reduce(function(a, b) { return a + b; }, 0) / confs.length, 1) : "--";
 
   var insNode = $("#insNode");
   if (insNode) {
@@ -500,10 +505,10 @@ function renderInspector() {
         var isL = state.cluster && state.cluster.leader_id && (nName.indexOf(state.cluster.leader_id) >= 0 || nName === state.cluster.leader_id);
         insNode.innerHTML = '<span class="mono">' + esc(nName) + '</span>' + (isL ? ' <span class="tag-leader" style="font-size:8.5px">LÍDER</span>' : ' <span class="tag-replica" style="font-size:8.5px">RÉPLICA</span>');
       } else {
-        insNode.innerHTML = '<span class="mono" style="color:var(--muted2)">—</span>';
+        insNode.innerHTML = '<span class="mono" style="color:var(--muted2)">--</span>';
       }
     } else {
-      insNode.textContent = "—";
+      insNode.textContent = "--";
     }
   }
 
@@ -516,7 +521,7 @@ function renderInspector() {
       }
       insRep.innerHTML = rHtml;
     } else {
-      insRep.textContent = "—";
+      insRep.textContent = "--";
     }
   }
 
@@ -534,7 +539,7 @@ function renderInspector() {
         var r = +c.row || 0, cc = +c.col || 0;
         return '<tr tabindex="0" data-i="' + esc(c.index) + '" data-r="' + r + '" data-c="' + cc + '">' +
           '<td>#' + pad2(+c.index || 0) + '</td><td>' + pad2(r + 1) + '</td><td>' + pad2(cc + 1) + '</td>' +
-          '<td class="c-status">' + esc(DEFECT_LABEL[c.defect_type] || String(c.defect_type || "—").toUpperCase()) + '</td>' +
+          '<td class="c-status">' + esc(DEFECT_LABEL[c.defect_type] || String(c.defect_type || "--").toUpperCase()) + '</td>' +
           '<td class="c-conf">' + confPct(c.confidence, 1) + '</td></tr>';
       }).join("");
     }
@@ -651,18 +656,18 @@ function renderTopology() {
         var isOnline = (n.status || "ONLINE").toUpperCase() === "ONLINE";
         var roleBadge = isLeader ? '<span class="tag-leader">LÍDER</span>' : '<span class="tag-replica">RÉPLICA</span>';
         var statusBadge = isOnline ? '<span class="tag tag-pass">ONLINE</span>' : '<span class="tag tag-fail">OFFLINE</span>';
-        var shaShort = n.model_sha256 ? ('<span title="' + esc(n.model_sha256) + '" class="mono">' + esc(n.model_sha256.slice(0, 10)) + '…</span>') : '<span class="mono" style="color:var(--muted2)">—</span>';
+        var shaShort = n.model_sha256 ? ('<span title="' + esc(n.model_sha256) + '" class="mono">' + esc(n.model_sha256.slice(0, 10)) + '…</span>') : '<span class="mono" style="color:var(--muted2)">--</span>';
         var lastSeen = "ativo agora";
         if (n.last_seen) {
           var d = isNaN(n.last_seen) ? new Date(n.last_seen) : new Date(Number(n.last_seen) * 1000);
           lastSeen = !isNaN(d.getTime()) ? d.toLocaleTimeString("pt-BR") : "ativo agora";
         }
         return '<tr>' +
-          '<td><strong>' + esc(n.node_id || "—") + '</strong></td>' +
+          '<td><strong>' + esc(n.node_id || "--") + '</strong></td>' +
           '<td class="mono">' + esc(n.dns_name || (n.node_id + ".luminapv.local")) + '</td>' +
           '<td>' + roleBadge + '</td>' +
           '<td>' + statusBadge + '</td>' +
-          '<td class="mono" style="color:var(--muted2)">' + esc(n.endpoint || "—") + '</td>' +
+          '<td class="mono" style="color:var(--muted2)">' + esc(n.endpoint || "--") + '</td>' +
           '<td>' + shaShort + '</td>' +
           '<td class="mono">' + esc(lastSeen) + '</td>' +
           '</tr>';
@@ -694,24 +699,24 @@ function setStatusBar(mode, http) {
   if (st) st.textContent = mode === "busy" ? "ANALISANDO" : (mode === "erro" ? "FALHA" : "PRONTO");
   if (http !== undefined) {
     var sbH = $("#sbHttp");
-    if (sbH) sbH.textContent = "HTTP " + (http || "—");
+    if (sbH) sbH.textContent = "HTTP " + (http || "--");
   }
   var m = activeModule();
   var sbA = $("#sbActive");
-  if (sbA) sbA.textContent = m ? ("MÓDULO " + m.module_id + (m.status === "FAIL" ? " · REPROVADO" : " · APROVADO")) : "MÓDULO —";
+  if (sbA) sbA.textContent = m ? ("MÓDULO " + m.module_id + (m.status === "FAIL" ? " · REPROVADO" : " · APROVADO")) : "MÓDULO --";
   var ct = computeCellTotals();
   var sbB = $("#sbBatch");
-  if (sbB) sbB.textContent = state.modules.length ? ("LOTE " + state.modules.length + " MÓD · " + int(ct.defective) + " CÉL. ANÔMALAS") : "LOTE —";
+  if (sbB) sbB.textContent = state.modules.length ? ("LOTE " + state.modules.length + " MÓD · " + int(ct.defective) + " CÉL. ANÔMALAS") : "LOTE --";
 
   var c = state.cluster;
   var sbLeader = $("#sbLeaderBadge");
   if (sbLeader) {
-    sbLeader.textContent = c && c.leader_id ? ("LÍDER: " + c.leader_id) : "LÍDER: —";
+    sbLeader.textContent = c && c.leader_id ? ("LÍDER: " + c.leader_id) : "LÍDER: --";
   }
   var sbNodes = $("#sbClusterNodes");
   if (sbNodes) {
     var count = (c && Array.isArray(c.nodes)) ? c.nodes.length : 0;
-    sbNodes.textContent = count ? (count + " NÓ" + (count > 1 ? "S" : "")) : "CLUSTER —";
+    sbNodes.textContent = count ? (count + " NÓ" + (count > 1 ? "S" : "")) : "CLUSTER --";
   }
   var sbCons = $("#sbConsistency");
   if (sbCons) {
@@ -755,7 +760,7 @@ function buildSyntheticThumbDataUri(item) {
 }
 
 function formatHistoryTimestamp(isoStr) {
-  if (!isoStr) return "—";
+  if (!isoStr) return "--";
   try {
     var d = new Date(isoStr);
     if (isNaN(d.getTime())) return String(isoStr);
@@ -831,7 +836,7 @@ function renderHistory() {
   }
 
   grid.innerHTML = items.map(function(item) {
-    var modId = item.module_id || "—";
+    var modId = item.module_id || "--";
     var isFail = item.status === "FAIL";
     var isSelected = state.activeId === modId || h.selectedItem === modId;
     var badgeHtml = isFail
@@ -844,7 +849,7 @@ function renderHistory() {
 
     return '<article class="history-card' + (isSelected ? ' is-selected' : '') + '" role="listitem" data-module-id="' + esc(modId) + '">' +
       '<div class="history-thumb-wrap">' +
-        '<img class="history-thumb" src="' + esc(thumbSrc) + '" data-fallback="' + esc(fallbackThumb) + '" alt="Preview EL ' + esc(item.filename || modId) + '" loading="lazy" />' +
+        '<img class="history-thumb" width="84" height="64" src="' + esc(thumbSrc) + '" data-fallback="' + esc(fallbackThumb) + '" alt="Preview EL ' + esc(item.filename || modId) + '" loading="lazy" />' +
         '<span class="history-thumb-badge">' + badgeHtml + '</span>' +
       '</div>' +
       '<div class="history-card-body">' +
@@ -964,6 +969,8 @@ function closeAuthModal() {
   backdrop.hidden = true;
   state.auth.error = null;
   renderAuthUI();
+  var openBtn = $("#authOpenBtn");
+  if (openBtn) setTimeout(function() { openBtn.focus(); }, 20);
 }
 
 /* ---------- selection ---------- */
@@ -986,7 +993,7 @@ function selectModule(id, opts) {
   setStatusBar(state.loading ? "busy" : (state.errorId ? "erro" : "idle"));
   if (opts && opts.focus) focusTreeItem(id);
   var m = moduleById(id);
-  log("info", "Módulo " + id + " (" + (m.filename || "—") + ") carregado no inspetor · " + defects(m).length + " anomalias");
+  log("info", "Módulo " + id + " (" + (m.filename || "--") + ") carregado no inspetor · " + defects(m).length + " anomalias");
 }
 
 function applyCellSelection() {
