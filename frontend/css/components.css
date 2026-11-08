@@ -786,6 +786,8 @@ pre.json {
 .log .lvl.err { color: var(--defect-ink); }
 .log .lvl.ok { color: var(--pass); }
 .log .lvl.req { color: var(--d5); }
+.log .lvl.warn { color: var(--warn); }
+.log .lvl.info { color: var(--d5); }
 
 .log .msg {
   flex: 1 1 auto;
