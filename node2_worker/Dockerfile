@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source code and models
-COPY cv_engine.py main.py ./
+COPY cv_engine.py main.py sqs_task_consumer.py ./
 COPY models/ ./models/
 
 # Expose port

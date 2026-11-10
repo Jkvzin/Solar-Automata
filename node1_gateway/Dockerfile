@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY node1_gateway/main.py .
 COPY node1_gateway/auth.py .
 COPY node1_gateway/history.py .
+COPY node1_gateway/sqs_audit_consumer.py .
 COPY luminapv-el-console.html ./luminapv-el-console.html
 COPY frontend/ ./frontend/
 COPY fixtures/ ./fixtures/

@@ -34,9 +34,29 @@ import redis.asyncio as aioredis
 try:
     from node1_gateway.auth import auth_router, verify_optional_or_enforced_auth, UserRecord
     from node1_gateway.history import history_router, history_service
+    from node1_gateway.sqs_audit_consumer import sqs_consumer, SQSAuditConsumer
 except ImportError:
     from auth import auth_router, verify_optional_or_enforced_auth, UserRecord
     from history import history_router, history_service
+    from sqs_audit_consumer import sqs_consumer, SQSAuditConsumer
+
+try:
+    from node2_worker.sqs_task_consumer import (
+        _SHARED_LOCAL_RAW_STORAGE,
+        _SHARED_LOCAL_TASK_QUEUE,
+        _SHARED_LOCAL_BATCH_STORE,
+    )
+except ImportError:
+    try:
+        from sqs_task_consumer import (
+            _SHARED_LOCAL_RAW_STORAGE,
+            _SHARED_LOCAL_TASK_QUEUE,
+            _SHARED_LOCAL_BATCH_STORE,
+        )
+    except ImportError:
+        _SHARED_LOCAL_RAW_STORAGE = {}
+        _SHARED_LOCAL_TASK_QUEUE = []
+        _SHARED_LOCAL_BATCH_STORE = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,12 +88,16 @@ except Exception as _boto_err:
     s3_client = None
     sqs_client = None
 
-# Bind dynamic S3/SQS providers to UserHistoryService so runtime/test mocks of s3_client are honored
+# Bind dynamic S3/SQS providers to UserHistoryService and SQSAuditConsumer so runtime/test mocks of s3_client are honored
 history_service._s3_client_provider = lambda: s3_client
 history_service._sqs_client_provider = lambda: sqs_client
 history_service.bucket_name = BUCKET_NAME
 history_service.aws_region = AWS_REGION
 history_service.queue_url = QUEUE_URL
+
+sqs_consumer._sqs_client_provider = lambda: sqs_client
+sqs_consumer.queue_url = QUEUE_URL
+sqs_consumer.enabled = AWS_INGESTION_ENABLED
 
 # Distributed Lock & Service Discovery Storage
 ACTIVE_LOCKS_KEY = "luminapv:active_locks"
@@ -345,7 +369,9 @@ resolver = ServiceCatalogResolver(REDIS_URL, WORKER_SERVICE_URL, WORKER_SERVICE_
 async def lifespan(app: FastAPI):
     await resolver.get_client()
     await lock_manager.get_client()
+    await sqs_consumer.start()
     yield
+    await sqs_consumer.stop()
     if resolver.redis_client is not None:
         try:
             await resolver.redis_client.close()
@@ -440,6 +466,26 @@ class BulkAnalysisResponse(BaseModel):
     modules: List[Dict[str, Any]]
 
 
+class BatchCreatedResponse(BaseModel):
+    batch_id: str
+    status: str = "QUEUED"
+    total_queued: int
+    poll_url: str
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    total_modules: int
+    completed_modules: int
+    failed_modules: int
+    progress_percentage: float
+    batch_summary: Optional[BatchSummary] = None
+    modules: List[Dict[str, Any]] = Field(default_factory=list)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 # -----------------------------------------------------------------------------
 # Web & Static Asset Endpoints
 # -----------------------------------------------------------------------------
@@ -505,7 +551,9 @@ async def health_check():
         "status": "healthy",
         "service": "node1_gateway",
         "worker_service_url": WORKER_SERVICE_URL,
-        "worker_connectivity": worker_status
+        "worker_connectivity": worker_status,
+        "aws_ingestion_enabled": AWS_INGESTION_ENABLED,
+        "sqs_audit_consumer": sqs_consumer.get_stats()
     }
 
 
@@ -582,21 +630,20 @@ async def dispatch_module_to_worker(
 
 @app.post(
     "/api/v1/analyze/bulk",
-    response_model=BulkAnalysisResponse,
-    status_code=status.HTTP_200_OK,
+    response_model=BatchCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     tags=["Analysis"],
-    summary="Bulk ingestion and parallel dispatch of photovoltaic module scans"
+    summary="Asynchronous bulk ingestion of photovoltaic module scans via work queue"
 )
 async def analyze_bulk(
     files: list[UploadFile],
     current_user: Optional[UserRecord] = Depends(verify_optional_or_enforced_auth)
 ):
     """
-    Primary ingestion endpoint for the LuminaPV Console.
-    Receives N module images in a single multipart request, protects critical section
-    using DistributedLock ('lock:module:<sha256>') per image (Issue #3), balances load
-    across active workers via Round-Robin with automatic failover (Issue #4),
-    and safely integrates AWS S3/SQS with fallback for local runs.
+    Primary asynchronous ingestion endpoint for LuminaPV Work Queues.
+    Receives N module images in a multipart request, persists raw uploads in S3 (or Redis/memory fallback),
+    initializes the batch tracker in Redis ('luminapv:batch:{batch_id}'), publishes inspection task messages
+    to AWS SQS (or Redis fallback task queue), and immediately returns HTTP 202 Accepted with a poll_url.
     """
     if not files:
         raise HTTPException(
@@ -604,130 +651,184 @@ async def analyze_bulk(
             detail="No files received in multipart request key 'files'."
         )
 
-    logger.info(f"Initiating parallel bulk analysis for {len(files)} module scans...")
+    batch_id = f"batch-{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    total_modules = len(files)
+    user_id = current_user.user_id if current_user else "anonymous"
 
-    # 1. Carrega payloads dos arquivos em memória e atribui scan_id único por arquivo
-    file_payloads = []
+    logger.info(f"Ingesting asynchronous batch '{batch_id}' with {total_modules} module scans...")
+
+    client = await resolver.get_client()
+
+    # 1. Initialize batch tracker in Redis and shared memory fallback
+    initial_tracker = {
+        "batch_id": batch_id,
+        "total_modules": total_modules,
+        "completed_modules": 0,
+        "failed_modules": 0,
+        "status": "PROCESSING",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "results": []
+    }
+    if client is not None:
+        try:
+            await client.set(f"luminapv:batch:{batch_id}", json.dumps(initial_tracker), ex=86400)
+        except Exception as e:
+            logger.debug(f"Redis batch tracker init fallback for '{batch_id}': {e}")
+
+    _SHARED_LOCAL_BATCH_STORE[batch_id] = initial_tracker
+
+    # 2. Process each image: persist raw bytes and publish task message
     for f in files:
         await f.seek(0)
         content = await f.read()
         scan_id = uuid.uuid4().hex[:12]
-        file_payloads.append((content, f.filename or "module.png", f.content_type or "image/png", scan_id))
-
-    # 2. Resolução dinâmica de nomes e descoberta de workers no catálogo Redis
-    healthy_endpoints = await resolver.get_healthy_endpoints()
-
-    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
-    timeout = httpx.Timeout(GATEWAY_TIMEOUT_SECONDS, connect=10.0)
-
-    # Função interna para processar cada módulo com lock distribuído e balanceamento
-    async def process_module_with_lock_and_routing(
-        client: httpx.AsyncClient,
-        content: bytes,
-        name: str,
-        ctype: str,
-        target_url: str,
-        candidates: List[str]
-    ):
+        filename = f.filename or "module.png"
         content_sha256 = hashlib.sha256(content).hexdigest()
-        lock_resource = f"lock:module:{content_sha256}"
-        lock = lock_manager.create_lock(lock_resource, ttl_seconds=DEFAULT_LOCK_TTL_SECONDS)
+        s3_image_key = f"raw_uploads/{batch_id}/{scan_id}.png"
+        user_prefix = f"users/{user_id}" if user_id and user_id != "anonymous" else "anonymous"
+        user_image_key = f"{user_prefix}/scans/{scan_id}_{filename}"
 
-        # Exclusão Mútua Distribuída na seção crítica de processamento da imagem
-        async with lock:
+        # Save raw image to S3 if enabled (both under raw_uploads and user-partitioned gallery)
+        if s3_client is not None and BUCKET_NAME:
             try:
-                import inspect
-                sig = inspect.signature(dispatch_module_to_worker)
-                if len(sig.parameters) == 4:
-                    return await dispatch_module_to_worker(client, content, name, ctype)
-                else:
-                    return await dispatch_module_to_worker(
-                        client=client,
-                        file_bytes=content,
-                        filename=name,
-                        content_type=ctype,
-                        target_worker_url=target_url,
-                        candidate_worker_urls=candidates
-                    )
-            except TypeError:
-                return await dispatch_module_to_worker(client, content, name, ctype)
-
-    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
-        tasks = []
-        base_rr = resolver.rr_index
-        for idx, (content, name, ctype, _scan_id) in enumerate(file_payloads):
-            target_url = healthy_endpoints[(base_rr + idx) % len(healthy_endpoints)]
-            candidates = [target_url] + [u for u in healthy_endpoints if u != target_url]
-            tasks.append(
-                process_module_with_lock_and_routing(
-                    client, content, name, ctype, target_url, candidates
+                await asyncio.to_thread(
+                    s3_client.put_object,
+                    Bucket=BUCKET_NAME,
+                    Key=s3_image_key,
+                    Body=content,
+                    ContentType=f.content_type or "image/png"
                 )
-            )
+                await asyncio.to_thread(
+                    s3_client.put_object,
+                    Bucket=BUCKET_NAME,
+                    Key=user_image_key,
+                    Body=content,
+                    ContentType=f.content_type or "image/png"
+                )
+            except Exception as s3_err:
+                logger.warning(f"S3 raw upload fallback for '{s3_image_key}': {s3_err}")
 
-        resolver.rr_index += len(file_payloads)
-        # Execução paralela balanceada entre workers
-        raw_modules = await asyncio.gather(*tasks)
+        # Save raw image to Redis buffer cache for worker container retrieval
+        if client is not None:
+            try:
+                await client.set(f"luminapv:raw:{s3_image_key}", content, ex=86400)
+                await client.set(f"luminapv:raw:{user_image_key}", content, ex=86400)
+            except Exception:
+                pass
 
-    # 3. Ensure unique module_id across batch & persist user-partitioned S3 objects + reports
-    seen_ids = set()
-    modules: List[Dict[str, Any]] = []
-    batch_ts = datetime.now(timezone.utc).isoformat()
+        _SHARED_LOCAL_RAW_STORAGE[s3_image_key] = content
+        _SHARED_LOCAL_RAW_STORAGE[user_image_key] = content
 
-    for idx, raw_mod in enumerate(raw_modules, start=1):
-        m = dict(raw_mod) if isinstance(raw_mod, dict) else {}
-        content, name, ctype, scan_id = file_payloads[idx - 1]
-        mid = m.get("module_id")
-        if not mid:
-            mid = f"MOD-2026-{idx:03d}"
-        elif mid in seen_ids:
-            mid = f"{mid}-{scan_id[:4].upper()}"
-        m["module_id"] = mid
+        # Task message contract
+        task_msg = {
+            "task_type": "INSPECT_MODULE",
+            "batch_id": batch_id,
+            "scan_id": scan_id,
+            "filename": filename,
+            "s3_image_key": s3_image_key,
+            "user_image_key": user_image_key,
+            "content_sha256": content_sha256,
+            "user_id": user_id
+        }
 
-        if not m.get("timestamp"):
-            m["timestamp"] = batch_ts
+        # Publish to AWS SQS if client is active
+        if sqs_client is not None and QUEUE_URL:
+            try:
+                await asyncio.to_thread(
+                    sqs_client.send_message,
+                    QueueUrl=QUEUE_URL,
+                    MessageBody=json.dumps(task_msg)
+                )
+            except Exception as sqs_err:
+                logger.warning(f"AWS SQS task publish fallback for '{s3_image_key}': {sqs_err}")
 
-        await history_service.persist_module_inspection(
-            module_data=m,
-            image_bytes=content,
-            filename=name,
-            content_type=ctype,
-            user=current_user,
-            scan_id=scan_id
+        # Always enqueue into Redis list and in-memory queue for offline/local workers
+        if client is not None:
+            try:
+                await client.rpush("luminapv:queue:tasks", json.dumps(task_msg))
+            except Exception:
+                pass
+
+        _SHARED_LOCAL_TASK_QUEUE.append(task_msg)
+
+    return BatchCreatedResponse(
+        batch_id=batch_id,
+        status="QUEUED",
+        total_queued=total_modules,
+        poll_url=f"/api/v1/batches/{batch_id}"
+    )
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}",
+    response_model=BatchStatusResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Analysis"],
+    summary="Poll status and consolidated results of an asynchronous inspection batch"
+)
+async def get_batch_status(batch_id: str):
+    """
+    Returns the real-time progress and completed inspection results for batch_id.
+    When completed_modules + failed_modules == total_modules, status is updated to 'COMPLETED'.
+    """
+    batch = None
+    client = await resolver.get_client()
+
+    if client is not None:
+        try:
+            raw = await client.get(f"luminapv:batch:{batch_id}")
+            if raw:
+                batch = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except Exception:
+            pass
+
+    if not batch:
+        batch = _SHARED_LOCAL_BATCH_STORE.get(batch_id)
+
+    if not batch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch '{batch_id}' not found."
         )
-        seen_ids.add(m.get("module_id", mid))
-        modules.append(m)
 
-    # Compute batch-wide aggregated telemetry
-    total_modules = len(modules)
-    defective_modules_count = sum(1 for m in modules if m.get("status") == "FAIL")
+    total = int(batch.get("total_modules", 0))
+    completed = int(batch.get("completed_modules", 0))
+    failed = int(batch.get("failed_modules", 0))
+    results = list(batch.get("results", []))
 
-    batch_failure_percentage = (
-        round((defective_modules_count / float(total_modules)) * 100.0, 1)
-        if total_modules > 0 else 0.0
+    if (completed + failed) >= total and total > 0:
+        batch["status"] = "COMPLETED"
+        progress_pct = 100.0
+    else:
+        progress_pct = round(((completed + failed) / float(total)) * 100.0, 1) if total > 0 else 0.0
+
+    # Calculate batch summary metrics
+    total_m = len(results)
+    defective_count = sum(1 for m in results if m.get("status") == "FAIL")
+    batch_failure_pct = round((defective_count / float(total_m)) * 100.0, 1) if total_m > 0 else 0.0
+    total_damage = sum(float(m.get("module_damage_percentage", 0.0)) for m in results)
+    avg_damage = round(total_damage / float(total_m), 1) if total_m > 0 else 0.0
+
+    summary = BatchSummary(
+        total_modules=total_m,
+        defective_modules_count=defective_count,
+        batch_failure_percentage=batch_failure_pct,
+        average_cell_degradation_percentage=avg_damage
     )
 
-    total_damage_sum = sum(float(m.get("module_damage_percentage", 0.0)) for m in modules)
-    average_cell_degradation_percentage = (
-        round(total_damage_sum / float(total_modules), 1)
-        if total_modules > 0 else 0.0
-    )
-
-    batch_summary = BatchSummary(
-        total_modules=total_modules,
-        defective_modules_count=defective_modules_count,
-        batch_failure_percentage=batch_failure_percentage,
-        average_cell_degradation_percentage=average_cell_degradation_percentage
-    )
-
-    logger.info(
-        f"Bulk analysis complete: {total_modules} modules processed, "
-        f"{defective_modules_count} failed ({batch_failure_percentage}%), "
-        f"avg cell degradation: {average_cell_degradation_percentage}%"
-    )
-
-    return BulkAnalysisResponse(
-        batch_summary=batch_summary,
-        modules=modules
+    return BatchStatusResponse(
+        batch_id=batch_id,
+        status=batch.get("status", "PROCESSING"),
+        total_modules=total,
+        completed_modules=completed,
+        failed_modules=failed,
+        progress_percentage=progress_pct,
+        batch_summary=summary,
+        modules=results,
+        created_at=batch.get("created_at"),
+        updated_at=batch.get("updated_at")
     )
 
 
@@ -820,6 +921,7 @@ async def get_cluster_status():
         "nodes": nodes,
         "active_locks": active_locks,
         "replication_stats": replication_stats,
+        "sqs_audit": sqs_consumer.get_stats(),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 

@@ -78,6 +78,35 @@ def build_user_partition_keys(
     return image_key, report_key
 
 
+def build_audit_event_payload(
+    module_data: Dict[str, Any],
+    image_key: str,
+    scan_id: str,
+    timestamp: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Constructs standardized canonical event payload for AWS SQS audit queue.
+    """
+    ts = timestamp or module_data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    module_id = str(module_data.get("module_id") or "UNKNOWN")
+    status_val = str(module_data.get("status") or "PASS").upper()
+    damage = float(module_data.get("module_damage_percentage", module_data.get("damage_percentage", 0.0)))
+    processed_by = str(module_data.get("processed_by_node") or module_data.get("processed_by") or "worker-1")
+    model_hash = str(module_data.get("model_sha256") or "N/A")
+
+    return {
+        "event_type": "MODULE_INSPECTED",
+        "timestamp": ts,
+        "module_id": module_id,
+        "scan_id": scan_id,
+        "status": status_val,
+        "damage_percentage": round(damage, 2),
+        "s3_image_key": image_key,
+        "processed_by": processed_by,
+        "model_sha256": model_hash
+    }
+
+
 # -----------------------------------------------------------------------------
 # Pydantic DTOs for History Endpoints
 # -----------------------------------------------------------------------------
@@ -380,14 +409,20 @@ class UserHistoryService:
 
         if sqs is not None and self.queue_url:
             try:
+                event_payload = build_audit_event_payload(
+                    module_data=module_data,
+                    image_key=image_key,
+                    scan_id=scan_uid,
+                    timestamp=now_iso
+                )
                 await asyncio.to_thread(
                     sqs.send_message,
                     QueueUrl=self.queue_url,
-                    MessageBody=image_key
+                    MessageBody=json.dumps(event_payload)
                 )
             except Exception as sqs_err:
                 logger.warning(
-                    f"AWS SQS notification fallback for '{image_key}': {sqs_err}."
+                    f"AWS SQS notification fallback for module '{module_id}' (key='{image_key}'): {sqs_err}."
                 )
 
         return module_data

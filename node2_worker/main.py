@@ -24,6 +24,21 @@ import redis.asyncio as aioredis
 
 from cv_engine import evaluate_module, generate_module_id, get_model_sha256, ModuleResult
 
+try:
+    from node2_worker.sqs_task_consumer import (
+        WorkerTaskConsumer,
+        _SHARED_LOCAL_RAW_STORAGE,
+        _SHARED_LOCAL_TASK_QUEUE,
+        _SHARED_LOCAL_BATCH_STORE
+    )
+except ImportError:
+    from sqs_task_consumer import (
+        WorkerTaskConsumer,
+        _SHARED_LOCAL_RAW_STORAGE,
+        _SHARED_LOCAL_TASK_QUEUE,
+        _SHARED_LOCAL_BATCH_STORE
+    )
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [node2-worker] %(message)s"
@@ -52,6 +67,11 @@ LEADER_KEY = "luminapv:leader"
 LEADER_TERM_KEY = "luminapv:leader:term"
 LEADER_LEASE_TTL_SECONDS = int(os.getenv("LEADER_LEASE_TTL_SECONDS", "8"))
 ELECTION_CHECK_INTERVAL_SECONDS = float(os.getenv("ELECTION_CHECK_INTERVAL_SECONDS", "2.0"))
+
+AWS_INGESTION_ENABLED = os.getenv("AWS_INGESTION_ENABLED", "false").lower() in ("true", "1", "yes")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "us-east-2"))
+BUCKET_NAME = os.getenv("AWS_S3_BUCKET", "dataset-paineis-solares-joaoguilherme-joaovictor-gustavo-2026")
+QUEUE_URL = os.getenv("AWS_SQS_QUEUE_URL", "https://sqs.us-east-2.amazonaws.com/058835009582/fila-imagens-paineis-solares")
 
 
 class LRUReplicaStore(OrderedDict):
@@ -602,13 +622,24 @@ class LeaderElectionManager:
 registry = WorkerServiceRegistry()
 replicator = DistributedResultReplicator(registry)
 election_manager = LeaderElectionManager(registry)
+task_consumer = WorkerTaskConsumer(
+    node_id=NODE_ID,
+    redis_url=REDIS_URL,
+    queue_url=QUEUE_URL,
+    bucket_name=BUCKET_NAME,
+    aws_region=AWS_REGION,
+    aws_ingestion_enabled=AWS_INGESTION_ENABLED,
+    replicator=replicator
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await registry.start()
     await election_manager.start()
+    await task_consumer.start()
     yield
+    await task_consumer.stop()
     await election_manager.stop()
     await registry.stop()
 
@@ -680,6 +711,7 @@ async def health_check():
         "model_consistent": stats["model_consistent"],
         "consistency_model": stats["consistency_model"],
         "replicated_modules_count": stats["total_replicated_modules"],
+        "task_consumer": task_consumer.get_stats(),
         "last_seen": meta["last_seen"],
         "registry_backend": meta["registry_backend"],
     }

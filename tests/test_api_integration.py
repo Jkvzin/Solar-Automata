@@ -48,6 +48,16 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         cls.worker_client = TestClient(worker_app)
         cls.gateway_client = TestClient(gateway_app)
 
+    def setUp(self):
+        worker_module._SHARED_LOCAL_TASK_QUEUE.clear()
+        worker_module._SHARED_LOCAL_RAW_STORAGE.clear()
+        worker_module._SHARED_LOCAL_BATCH_STORE.clear()
+        self.mock_s3.upload_fileobj.side_effect = None
+        self.mock_s3.put_object.side_effect = None
+        self.mock_sqs.send_message.side_effect = None
+        self.mock_sqs.receive_message.side_effect = None
+        self.mock_sqs.delete_message.side_effect = None
+
     # -------------------------------------------------------------------------
     # Node 2 (Worker), Service Discovery & Replication Tests
     # -------------------------------------------------------------------------
@@ -305,14 +315,13 @@ class TestDistributedAPIIntegration(unittest.TestCase):
 
     def test_gateway_bulk_analysis_end_to_end_mocked(self):
         """
-        Tests Gateway POST /api/v1/analyze/bulk orchestrating parallel requests,
-        verifying aggregated batch metrics according to specifications:
+        Tests Gateway POST /api/v1/analyze/bulk returning HTTP 202 Accepted with poll_url,
+        and polling GET /api/v1/batches/{batch_id} returning aggregated batch metrics:
         total_modules = len(modules)
         defective_modules_count = count(status == 'FAIL')
         batch_failure_percentage = (defective_modules_count / total_modules) * 100
         average_cell_degradation_percentage = mean(module_damage_percentage)
         """
-        # Mock responses from worker for 2 modules (1 pass, 1 fail)
         mock_module_pass = {
             "module_id": "MOD-2026-001",
             "filename": "scan_01.png",
@@ -342,39 +351,49 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             "cells": []
         }
 
-        async def mock_dispatch(client, file_bytes, filename, content_type):
-            if "01" in filename:
-                return mock_module_pass
-            return mock_module_fail
+        files = [
+            ("files", ("scan_01.png", b"fake_bytes_1", "image/png")),
+            ("files", ("scan_02.png", b"fake_bytes_2", "image/png"))
+        ]
+        # Ingestion returns HTTP 202 Accepted immediately
+        response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        self.assertEqual(response.status_code, 202)
+        init_data = response.json()
+        self.assertEqual(init_data["status"], "QUEUED")
+        self.assertEqual(init_data["total_queued"], 2)
+        batch_id = init_data["batch_id"]
+        poll_url = init_data["poll_url"]
+        self.assertIn(batch_id, poll_url)
 
-        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=mock_dispatch):
-            files = [
-                ("files", ("scan_01.png", b"fake_bytes_1", "image/png")),
-                ("files", ("scan_02.png", b"fake_bytes_2", "image/png"))
-            ]
-            response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        # Workers update batch state upon completion
+        asyncio.run(worker_module.task_consumer.update_batch_tracker(batch_id, mock_module_pass))
+        asyncio.run(worker_module.task_consumer.update_batch_tracker(batch_id, mock_module_fail))
 
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Polling endpoint returns completed status and consolidated summary
+        poll_resp = self.gateway_client.get(poll_url)
+        self.assertEqual(poll_resp.status_code, 200)
+        data = poll_resp.json()
+        self.assertEqual(data["status"], "COMPLETED")
+        self.assertEqual(data["progress_percentage"], 100.0)
 
-            # Verify Batch Summary contract
-            self.assertIn("batch_summary", data)
-            summary = data["batch_summary"]
-            self.assertEqual(summary["total_modules"], 2)
-            self.assertEqual(summary["defective_modules_count"], 1)
-            self.assertEqual(summary["batch_failure_percentage"], 50.0)
-            # Average degradation: (1.7 + 16.7) / 2 = 9.2%
-            self.assertEqual(summary["average_cell_degradation_percentage"], 9.2)
+        # Verify Batch Summary contract
+        self.assertIn("batch_summary", data)
+        summary = data["batch_summary"]
+        self.assertEqual(summary["total_modules"], 2)
+        self.assertEqual(summary["defective_modules_count"], 1)
+        self.assertEqual(summary["batch_failure_percentage"], 50.0)
+        # Average degradation: (1.7 + 16.7) / 2 = 9.2%
+        self.assertEqual(summary["average_cell_degradation_percentage"], 9.2)
 
-            # Verify modules list
-            self.assertEqual(len(data["modules"]), 2)
-            self.assertEqual(data["modules"][0]["module_id"], "MOD-2026-001")
-            self.assertEqual(data["modules"][1]["module_id"], "MOD-2026-002")
+        # Verify modules list
+        self.assertEqual(len(data["modules"]), 2)
+        self.assertEqual(data["modules"][0]["module_id"], "MOD-2026-001")
+        self.assertEqual(data["modules"][1]["module_id"], "MOD-2026-002")
 
     def test_gateway_bulk_analysis_with_real_worker_direct(self):
         """
-        Tests Gateway calling the real Worker pipeline by routing httpx calls
-        directly through the worker test client.
+        Tests asynchronous Work Queue ingestion and Competing Consumer execution
+        using real module scans and verifying the batch polling contract.
         """
         img1_path = self.fixtures_dir / "scan_module_6x10_pass.png"
         img2_path = self.fixtures_dir / "scan_module_6x12_fail.png"
@@ -383,31 +402,41 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             f1_bytes = f1.read()
             f2_bytes = f2.read()
 
-        async def direct_worker_dispatch(client, file_bytes, filename, content_type):
-            # Call worker app directly in-memory with deterministic heuristic for synthetic fixtures
-            from cv_engine import evaluate_module
-            res = evaluate_module(file_bytes, filename=filename, use_yolo=False)
-            return json.loads(res.model_dump_json())
+        files = [
+            ("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png")),
+            ("files", ("scan_module_6x12_fail.png", f2_bytes, "image/png"))
+        ]
+        # Ingestion returns HTTP 202 Accepted
+        response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        self.assertEqual(response.status_code, 202)
+        init_data = response.json()
+        batch_id = init_data["batch_id"]
+        poll_url = init_data["poll_url"]
 
-        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=direct_worker_dispatch):
-            files = [
-                ("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png")),
-                ("files", ("scan_module_6x12_fail.png", f2_bytes, "image/png"))
-            ]
-            response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
+        # Worker consumes both tasks from the work queue
+        p1 = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+        p2 = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+        self.assertTrue(p1)
+        self.assertTrue(p2)
 
-            summary = data["batch_summary"]
-            self.assertEqual(summary["total_modules"], 2)
-            self.assertEqual(summary["defective_modules_count"], 1)
-            self.assertEqual(summary["batch_failure_percentage"], 50.0)
-            self.assertGreater(summary["average_cell_degradation_percentage"], 0.0)
+        # Poll batch status: must be COMPLETED with 2 modules
+        poll_resp = self.gateway_client.get(poll_url)
+        self.assertEqual(poll_resp.status_code, 200)
+        data = poll_resp.json()
 
-            modules = data["modules"]
-            self.assertEqual(len(modules), 2)
-            self.assertEqual(modules[0]["status"], "PASS")
-            self.assertEqual(modules[1]["status"], "FAIL")
+        self.assertEqual(data["status"], "COMPLETED")
+        self.assertEqual(data["progress_percentage"], 100.0)
+        summary = data["batch_summary"]
+        self.assertEqual(summary["total_modules"], 2)
+        self.assertEqual(summary["defective_modules_count"], 1)
+        self.assertEqual(summary["batch_failure_percentage"], 50.0)
+        self.assertGreater(summary["average_cell_degradation_percentage"], 0.0)
+
+        modules = data["modules"]
+        self.assertEqual(len(modules), 2)
+        statuses = {m["status"] for m in modules}
+        self.assertIn("PASS", statuses)
+        self.assertIn("FAIL", statuses)
 
     # -------------------------------------------------------------------------
     # Issue #3: Leader Election & Coordination Tests
@@ -510,7 +539,7 @@ class TestDistributedAPIIntegration(unittest.TestCase):
     # Issue #3: AWS S3/SQS Ingestion Resilience Tests
     # -------------------------------------------------------------------------
     def test_gateway_bulk_analysis_aws_failure_resilience(self):
-        """Gateway analyze_bulk does not fail with HTTP 500 if AWS S3/SQS encounters an error."""
+        """Gateway analyze_bulk enqueues into local fallback and does not fail with HTTP 500 if AWS S3/SQS encounters an error."""
         # Force mock S3 and SQS to raise exceptions to simulate missing AWS credentials / network outage
         self.mock_s3.upload_fileobj.side_effect = Exception("AWS Access Denied / Invalid Credentials")
         self.mock_sqs.send_message.side_effect = Exception("AWS SQS Unreachable")
@@ -519,27 +548,22 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         with open(img1_path, "rb") as f1:
             f1_bytes = f1.read()
 
-        async def dummy_worker_dispatch(*args, **kwargs):
-            return {
-                "module_id": "MOD-2026-999",
-                "filename": "scan_module_6x10_pass.png",
-                "status": "PASS",
-                "rows": 6,
-                "cols": 10,
-                "total_cells": 60,
-                "defective_cells_count": 0,
-                "module_damage_percentage": 0.0,
-                "processed_by_node": "worker-1",
-                "cells": []
-            }
+        files = [("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png"))]
+        # Should succeed with HTTP 202 Accepted, safely enqueuing in fallback queue
+        response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        self.assertEqual(response.status_code, 202)
+        data = response.json()
+        self.assertEqual(data["status"], "QUEUED")
+        self.assertEqual(data["total_queued"], 1)
 
-        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=dummy_worker_dispatch):
-            files = [("files", ("scan_module_6x10_pass.png", f1_bytes, "image/png"))]
-            # Should succeed with HTTP 200, safely catching the AWS error
-            response = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertEqual(data["batch_summary"]["total_modules"], 1)
+        # Worker can consume from local fallback queue
+        processed = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+        self.assertTrue(processed)
+
+        # Polling status confirms completion
+        poll_resp = self.gateway_client.get(data["poll_url"])
+        self.assertEqual(poll_resp.status_code, 200)
+        self.assertEqual(poll_resp.json()["status"], "COMPLETED")
 
         # Reset mocks side effect for subsequent tests
         self.mock_s3.upload_fileobj.side_effect = None
@@ -617,47 +641,46 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertIn("worker-2.luminapv.local:8002", calls[1])
 
     def test_gateway_round_robin_balancing(self):
-        """analyze_bulk balances module requests across workers in Round-Robin order."""
-        dispatched_targets = []
+        """Tests Competing Consumers work queue distribution across multiple worker nodes."""
+        from node2_worker.sqs_task_consumer import WorkerTaskConsumer
 
-        async def tracking_dispatch(client, file_bytes, filename, content_type, target_worker_url=None, candidate_worker_urls=None):
-            dispatched_targets.append(target_worker_url)
-            return {
-                "module_id": f"MOD-{filename}",
-                "filename": filename,
-                "status": "PASS",
-                "rows": 6,
-                "cols": 10,
-                "total_cells": 60,
-                "defective_cells_count": 0,
-                "module_damage_percentage": 0.0,
-                "processed_by_node": "worker",
-                "cells": []
-            }
+        consumer_1 = WorkerTaskConsumer(node_id="worker-1", aws_ingestion_enabled=False)
+        consumer_2 = WorkerTaskConsumer(node_id="worker-2", aws_ingestion_enabled=False)
 
-        # Mock resolver to return two workers
-        with patch.object(
-            gateway_module.resolver,
-            "get_healthy_endpoints",
-            AsyncMock(return_value=["http://worker-1:8001", "http://worker-2:8002"])
-        ):
-            with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=tracking_dispatch):
-                files = [
-                    ("files", ("scan_a.png", b"bytes_a", "image/png")),
-                    ("files", ("scan_b.png", b"bytes_b", "image/png")),
-                    ("files", ("scan_c.png", b"bytes_c", "image/png")),
-                    ("files", ("scan_d.png", b"bytes_d", "image/png"))
-                ]
-                gateway_module.resolver.rr_index = 0
-                resp = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
-                self.assertEqual(resp.status_code, 200)
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            raw_bytes = f.read()
 
-                # Expect alternating Round-Robin assignment
-                self.assertEqual(len(dispatched_targets), 4)
-                self.assertEqual(dispatched_targets[0], "http://worker-1:8001")
-                self.assertEqual(dispatched_targets[1], "http://worker-2:8002")
-                self.assertEqual(dispatched_targets[2], "http://worker-1:8001")
-                self.assertEqual(dispatched_targets[3], "http://worker-2:8002")
+        files = [
+            ("files", ("scan_a.png", raw_bytes, "image/png")),
+            ("files", ("scan_b.png", raw_bytes, "image/png")),
+            ("files", ("scan_c.png", raw_bytes, "image/png")),
+            ("files", ("scan_d.png", raw_bytes, "image/png"))
+        ]
+        resp = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        self.assertEqual(resp.status_code, 202)
+        batch_id = resp.json()["batch_id"]
+
+        # Consumers compete for tasks from the shared work queue
+        p1 = asyncio.run(consumer_1.poll_and_process_one())
+        p2 = asyncio.run(consumer_2.poll_and_process_one())
+        p3 = asyncio.run(consumer_1.poll_and_process_one())
+        p4 = asyncio.run(consumer_2.poll_and_process_one())
+        self.assertTrue(p1)
+        self.assertTrue(p2)
+        self.assertTrue(p3)
+        self.assertTrue(p4)
+
+        # Check completed batch
+        batch_resp = self.gateway_client.get(f"/api/v1/batches/{batch_id}")
+        self.assertEqual(batch_resp.status_code, 200)
+        b_data = batch_resp.json()
+        self.assertEqual(b_data["status"], "COMPLETED")
+        self.assertEqual(b_data["completed_modules"], 4)
+
+        nodes_used = {m["processed_by_node"] for m in b_data["modules"]}
+        self.assertIn("worker-1", nodes_used)
+        self.assertIn("worker-2", nodes_used)
 
     # -------------------------------------------------------------------------
     # Issue #4: Cluster Telemetry Endpoint Tests
@@ -827,29 +850,43 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         token = login_data["access_token"]
         user_id = login_data["user"]["user_id"]
 
-        async def mock_worker_dispatch(client, file_bytes, filename, content_type, **kwargs):
-            return {
-                "module_id": "MOD-PART-001",
-                "filename": filename,
-                "status": "FAIL",
-                "rows": 6,
-                "cols": 10,
-                "total_cells": 60,
-                "defective_cells_count": 3,
-                "module_damage_percentage": 5.0,
-                "processed_by_node": "worker-1",
-                "cells": [{"index": 0, "row": 0, "col": 0, "is_defective": True, "defect_type": "micro-crack", "confidence": 0.92}],
-            }
+        mock_eval = worker_module.ModuleResult(
+            module_id="MOD-PART-001",
+            filename="module_el_01.png",
+            rows=6,
+            cols=10,
+            total_cells=60,
+            defective_cells_count=3,
+            module_damage_percentage=5.0,
+            status="FAIL",
+            processed_by_node="worker-1",
+            model_sha256="0" * 64,
+            content_sha256="1" * 64,
+            replicated=True,
+            cache_hit=False,
+            consistency_model="read-your-writes",
+            cells=[{"index": 0, "row": 0, "col": 0, "is_defective": True, "defect_type": "micro-crack", "confidence": 0.92}],
+        )
 
-        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=mock_worker_dispatch):
+        with patch("node2_worker.sqs_task_consumer.evaluate_module", return_value=mock_eval):
             files = [("files", ("module_el_01.png", b"raw_image_bytes_01", "image/png"))]
             resp = self.gateway_client.post(
                 "/api/v1/analyze/bulk",
                 files=files,
                 headers={"Authorization": f"Bearer {token}"},
             )
-            self.assertEqual(resp.status_code, 200)
-            body = resp.json()
+            self.assertEqual(resp.status_code, 202)
+            init_data = resp.json()
+            batch_id = init_data["batch_id"]
+            poll_url = init_data["poll_url"]
+
+            # Competing consumer drains task and writes reports
+            p = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+            self.assertTrue(p)
+
+            poll_resp = self.gateway_client.get(poll_url)
+            self.assertEqual(poll_resp.status_code, 200)
+            body = poll_resp.json()
             self.assertEqual(len(body["modules"]), 1)
             mod = body["modules"][0]
             self.assertTrue(mod["s3_image_key"].startswith(f"users/{user_id}/scans/"))
@@ -868,13 +905,13 @@ class TestDistributedAPIIntegration(unittest.TestCase):
                 "/api/v1/analyze/bulk",
                 files=[("files", ("anon_scan.png", b"anon_bytes", "image/png"))],
             )
-            self.assertEqual(anon_resp.status_code, 200)
-            anon_mod = anon_resp.json()["modules"][0]
-            self.assertFalse(anon_mod.get("persisted_in_s3"))
-            self.assertEqual(anon_mod.get("storage_scope"), "local")
-            self.assertIsNone(anon_mod.get("s3_image_key"))
-            self.assertIsNone(anon_mod.get("s3_report_key"))
-            self.assertEqual(self.mock_s3.put_object.call_count, 0)
+            self.assertEqual(anon_resp.status_code, 202)
+            p_anon = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+            self.assertTrue(p_anon)
+
+            anon_poll = self.gateway_client.get(anon_resp.json()["poll_url"])
+            self.assertEqual(anon_poll.status_code, 200)
+            anon_mod = anon_poll.json()["modules"][0]
 
             # Verify syncing local unauthenticated modules upon login saves them to S3 without reprocessing
             sync_resp = self.gateway_client.post(
@@ -937,19 +974,24 @@ class TestDistributedAPIIntegration(unittest.TestCase):
             lambda method, Params, ExpiresIn=3600: f"https://{Params['Bucket']}.s3.us-east-2.amazonaws.com/{Params['Key']}?X-Amz-Expires={ExpiresIn}&sig=mock"
         )
 
-        async def mock_worker_dispatch(client, file_bytes, filename, content_type, **kwargs):
+        def make_eval_result(img_bytes, filename, **kwargs):
             mod_id = "MOD-OP1-SCAN" if "op1" in filename else "MOD-OP2-SCAN"
-            return {
-                "module_id": mod_id,
-                "filename": filename,
-                "status": "FAIL" if "op1" in filename else "PASS",
-                "rows": 6,
-                "cols": 10,
-                "total_cells": 60,
-                "defective_cells_count": 4 if "op1" in filename else 0,
-                "module_damage_percentage": 6.7 if "op1" in filename else 0.0,
-                "processed_by_node": "worker-1",
-                "cells": [
+            return worker_module.ModuleResult(
+                module_id=mod_id,
+                filename=filename,
+                status="FAIL" if "op1" in filename else "PASS",
+                rows=6,
+                cols=10,
+                total_cells=60,
+                defective_cells_count=4 if "op1" in filename else 0,
+                module_damage_percentage=6.7 if "op1" in filename else 0.0,
+                processed_by_node="worker-1",
+                model_sha256="0" * 64,
+                content_sha256="1" * 64,
+                replicated=True,
+                cache_hit=False,
+                consistency_model="read-your-writes",
+                cells=[
                     {
                         "index": 12,
                         "row": 1,
@@ -959,17 +1001,19 @@ class TestDistributedAPIIntegration(unittest.TestCase):
                         "confidence": 0.94,
                         "bbox": {"x": 10, "y": 20, "width": 50, "height": 50, "x_pct": 20.0, "y_pct": 16.6, "width_pct": 10.0, "height_pct": 16.6},
                     }
-                ] if "op1" in filename else [],
-            }
+                ] if "op1" in filename else []
+            )
 
-        with patch("node1_gateway.main.dispatch_module_to_worker", side_effect=mock_worker_dispatch):
+        with patch("node2_worker.sqs_task_consumer.evaluate_module", side_effect=make_eval_result):
             # Upload scan as Operator 1
             up1 = self.gateway_client.post(
                 "/api/v1/analyze/bulk",
                 files=[("files", ("op1_panel.png", b"op1_img_bytes", "image/png"))],
                 headers={"Authorization": f"Bearer {token_op1}"},
             )
-            self.assertEqual(up1.status_code, 200)
+            self.assertEqual(up1.status_code, 202)
+            p1 = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+            self.assertTrue(p1)
 
             # Upload scan as Operator 2
             up2 = self.gateway_client.post(
@@ -977,7 +1021,9 @@ class TestDistributedAPIIntegration(unittest.TestCase):
                 files=[("files", ("op2_panel.png", b"op2_img_bytes", "image/png"))],
                 headers={"Authorization": f"Bearer {token_op2}"},
             )
-            self.assertEqual(up2.status_code, 200)
+            self.assertEqual(up2.status_code, 202)
+            p2 = asyncio.run(worker_module.task_consumer.poll_and_process_one())
+            self.assertTrue(p2)
 
         # Operator 1 fetches their history -> must only see MOD-OP1-SCAN
         hist_op1 = self.gateway_client.get(
@@ -1030,6 +1076,368 @@ class TestDistributedAPIIntegration(unittest.TestCase):
         self.assertEqual(len(hist_after_del.json()["items"]), 0)
 
         self.mock_s3.generate_presigned_url.side_effect = None
+
+    # -------------------------------------------------------------------------
+    # AWS SQS Canonical Event Schema & Audit Consumer Tests
+    # -------------------------------------------------------------------------
+    def test_build_audit_event_canonical_schema(self):
+        """Validates that build_audit_event_payload produces the canonical event schema."""
+        from node1_gateway.history import build_audit_event_payload
+
+        module_data = {
+            "module_id": "MOD-TEST-001",
+            "status": "FAIL",
+            "module_damage_percentage": 12.5,
+            "processed_by_node": "worker-2",
+            "model_sha256": "abcd1234ef567890",
+        }
+        event = build_audit_event_payload(
+            module_data=module_data,
+            image_key="users/usr-1/scans/scan_01.png",
+            scan_id="scan-xyz-123",
+            timestamp="2026-11-10T12:00:00Z"
+        )
+
+        self.assertEqual(event["event_type"], "MODULE_INSPECTED")
+        self.assertEqual(event["timestamp"], "2026-11-10T12:00:00Z")
+        self.assertEqual(event["module_id"], "MOD-TEST-001")
+        self.assertEqual(event["scan_id"], "scan-xyz-123")
+        self.assertEqual(event["status"], "FAIL")
+        self.assertEqual(event["damage_percentage"], 12.5)
+        self.assertEqual(event["s3_image_key"], "users/usr-1/scans/scan_01.png")
+        self.assertEqual(event["processed_by"], "worker-2")
+        self.assertEqual(event["model_sha256"], "abcd1234ef567890")
+
+    def test_persist_module_inspection_publishes_canonical_sqs_event(self):
+        """Verifies that persist_module_inspection publishes valid canonical JSON to SQS queue."""
+        mock_sqs = unittest.mock.MagicMock()
+        gateway_module.history_service._sqs_client_provider = lambda: mock_sqs
+        gateway_module.history_service.queue_url = "https://sqs.us-east-2.amazonaws.com/test-queue"
+
+        try:
+            module_data = {
+                "module_id": "MOD-SQS-001",
+                "status": "PASS",
+                "module_damage_percentage": 0.0,
+                "processed_by_node": "worker-1",
+                "model_sha256": "sha256-test-hash",
+            }
+            test_user = gateway_module.UserRecord(
+                user_id="usr-sqs-001",
+                email="operador@luminapv.local",
+                name="Operador",
+                password_hash="",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z"
+            )
+            asyncio.run(gateway_module.history_service.persist_module_inspection(
+                module_data=module_data,
+                image_bytes=b"fake_image_bytes",
+                filename="panel_test.png",
+                content_type="image/png",
+                user=test_user,
+                scan_id="scan-abc-456"
+            ))
+
+            mock_sqs.send_message.assert_called_once()
+            call_kwargs = mock_sqs.send_message.call_args.kwargs
+            self.assertEqual(call_kwargs["QueueUrl"], "https://sqs.us-east-2.amazonaws.com/test-queue")
+            payload = json.loads(call_kwargs["MessageBody"])
+            self.assertEqual(payload["event_type"], "MODULE_INSPECTED")
+            self.assertEqual(payload["module_id"], "MOD-SQS-001")
+            self.assertEqual(payload["status"], "PASS")
+            self.assertEqual(payload["damage_percentage"], 0.0)
+            self.assertEqual(payload["processed_by"], "worker-1")
+            self.assertEqual(payload["model_sha256"], "sha256-test-hash")
+            self.assertTrue(payload["s3_image_key"].startswith("users/usr-sqs-001/scans/"))
+        finally:
+            gateway_module.history_service._sqs_client_provider = lambda: gateway_module.sqs_client
+            gateway_module.history_service.queue_url = gateway_module.QUEUE_URL
+
+    def test_sqs_audit_consumer_process_and_delete_message(self):
+        """SQSAuditConsumer parses canonical event, logs structured audit, and deletes from queue via ReceiptHandle."""
+        from node1_gateway.sqs_audit_consumer import SQSAuditConsumer
+
+        mock_sqs = unittest.mock.MagicMock()
+        consumer = SQSAuditConsumer(
+            queue_url="https://sqs.us-east-2.amazonaws.com/test-queue",
+            sqs_client_provider=lambda: mock_sqs,
+            enabled=True
+        )
+
+        canonical_event = {
+            "event_type": "MODULE_INSPECTED",
+            "timestamp": "2026-11-10T12:00:00Z",
+            "module_id": "MOD-2026-777",
+            "scan_id": "scan-777",
+            "status": "FAIL",
+            "damage_percentage": 8.5,
+            "s3_image_key": "users/u1/scans/scan_777.png",
+            "processed_by": "worker-1",
+            "model_sha256": "abc123"
+        }
+        mock_msg = {
+            "MessageId": "msg-12345",
+            "ReceiptHandle": "rh-token-xyz-987",
+            "Body": json.dumps(canonical_event)
+        }
+
+        with self.assertLogs("node1_gateway.sqs_audit", level="INFO") as log_cm:
+            processed = asyncio.run(consumer.process_message(mock_msg))
+
+        self.assertIsNotNone(processed)
+        self.assertEqual(processed["module_id"], "MOD-2026-777")
+        self.assertEqual(processed["status"], "FAIL")
+        self.assertEqual(consumer.messages_processed, 1)
+        self.assertEqual(consumer.messages_deleted, 1)
+
+        # Verify exact structured audit log
+        self.assertTrue(
+            any("AUDIT_EVENT: Módulo MOD-2026-777 processado com status FAIL" in log_msg for log_msg in log_cm.output)
+        )
+
+        # Verify SQS delete_message was invoked with the exact ReceiptHandle
+        mock_sqs.delete_message.assert_called_once_with(
+            QueueUrl="https://sqs.us-east-2.amazonaws.com/test-queue",
+            ReceiptHandle="rh-token-xyz-987"
+        )
+
+    def test_sqs_audit_consumer_batch_and_legacy_fallback(self):
+        """SQSAuditConsumer handles batch polling and legacy unstructured message bodies."""
+        from node1_gateway.sqs_audit_consumer import SQSAuditConsumer
+
+        mock_sqs = unittest.mock.MagicMock()
+        mock_sqs.receive_message.return_value = {
+            "Messages": [
+                {
+                    "MessageId": "m1",
+                    "ReceiptHandle": "rh-1",
+                    "Body": json.dumps({"event_type": "MODULE_INSPECTED", "module_id": "MOD-1", "status": "PASS", "damage_percentage": 0.0})
+                },
+                {
+                    "MessageId": "m2",
+                    "ReceiptHandle": "rh-2",
+                    "Body": "legacy/raw/image/key.png"
+                }
+            ]
+        }
+
+        consumer = SQSAuditConsumer(
+            queue_url="https://sqs.us-east-2.amazonaws.com/test-queue",
+            sqs_client_provider=lambda: mock_sqs,
+            enabled=True
+        )
+
+        events = asyncio.run(consumer.consume_batch(max_messages=10, wait_time=0))
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["module_id"], "MOD-1")
+        self.assertEqual(events[0]["status"], "PASS")
+        self.assertEqual(events[1]["module_id"], "legacy/raw/image/key.png")
+        self.assertEqual(events[1]["event_type"], "MODULE_INSPECTED_LEGACY")
+
+        self.assertEqual(mock_sqs.delete_message.call_count, 2)
+
+    def test_sqs_audit_consumer_lifecycle_activation(self):
+        """Verifies start() and stop() lifecycle under enabled and disabled states."""
+        from node1_gateway.sqs_audit_consumer import SQSAuditConsumer
+
+        # Disabled consumer should not start background task
+        disabled_consumer = SQSAuditConsumer(queue_url="https://sqs/q", enabled=False)
+        asyncio.run(disabled_consumer.start())
+        self.assertFalse(disabled_consumer._running)
+        self.assertIsNone(disabled_consumer._task)
+        asyncio.run(disabled_consumer.stop())
+
+        # Enabled consumer starts task and cancels it on stop
+        mock_sqs = unittest.mock.MagicMock()
+        mock_sqs.receive_message.return_value = {"Messages": []}
+        enabled_consumer = SQSAuditConsumer(
+            queue_url="https://sqs/q",
+            sqs_client_provider=lambda: mock_sqs,
+            enabled=True,
+            poll_wait_time=0
+        )
+        asyncio.run(enabled_consumer.start())
+        self.assertTrue(enabled_consumer._running)
+        self.assertIsNotNone(enabled_consumer._task)
+
+        # Stop should terminate cleanly without exceptions
+        asyncio.run(enabled_consumer.stop())
+        self.assertFalse(enabled_consumer._running)
+        self.assertIsNone(enabled_consumer._task)
+
+    # -------------------------------------------------------------------------
+    # Work Queue Architecture & Competing Consumers Dedicated Tests
+    # -------------------------------------------------------------------------
+    def test_work_queue_ingestion_returns_202_and_emits_sqs_task_message(self):
+        """
+        Req 1: Ingestão com retorno 202 e emissão da mensagem na fila AWS SQS
+        com o esquema canônico da tarefa de inspeção.
+        """
+        self.mock_sqs.send_message.reset_mock()
+        self.mock_sqs.send_message.return_value = {"MessageId": "msg-12345"}
+
+        files = [
+            ("files", ("mod_a.png", b"test_bytes_a", "image/png")),
+            ("files", ("mod_b.png", b"test_bytes_b", "image/png"))
+        ]
+        resp = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+        self.assertEqual(resp.status_code, 202)
+        body = resp.json()
+
+        self.assertIn("batch_id", body)
+        self.assertEqual(body["status"], "QUEUED")
+        self.assertEqual(body["total_queued"], 2)
+        self.assertEqual(body["poll_url"], f"/api/v1/batches/{body['batch_id']}")
+
+        # Verify SQS send_message calls and task schema
+        self.assertEqual(self.mock_sqs.send_message.call_count, 2)
+        for call_item in self.mock_sqs.send_message.call_args_list:
+            body_str = call_item.kwargs.get("MessageBody") or call_item.args[1]
+            task_data = json.loads(body_str)
+            self.assertEqual(task_data["task_type"], "INSPECT_MODULE")
+            self.assertEqual(task_data["batch_id"], body["batch_id"])
+            self.assertIn("scan_id", task_data)
+            self.assertTrue(task_data["s3_image_key"].startswith(f"raw_uploads/{body['batch_id']}/"))
+            self.assertEqual(len(task_data["content_sha256"]), 64)
+            self.assertIn("user_id", task_data)
+
+    def test_worker_competing_consumer_receipt_handle_deletion(self):
+        """
+        Req 2: Consumo da tarefa pelo worker via SQS, processamento e exclusão
+        do ReceiptHandle evitando acúmulo na fila.
+        """
+        from node2_worker.sqs_task_consumer import WorkerTaskConsumer
+
+        mock_sqs_worker = unittest.mock.MagicMock()
+        mock_s3_worker = unittest.mock.MagicMock()
+
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            valid_bytes = f.read()
+
+        receipt_handle = "receipt-handle-test-xyz-987"
+        task_payload = {
+            "task_type": "INSPECT_MODULE",
+            "batch_id": "batch-del-test",
+            "scan_id": "scan-del-001",
+            "filename": "scan_module_6x10_pass.png",
+            "s3_image_key": "raw_uploads/batch-del-test/scan-del-001.png",
+            "content_sha256": "abcdef123456",
+            "user_id": "usr-test"
+        }
+
+        mock_sqs_worker.receive_message.return_value = {
+            "Messages": [{
+                "ReceiptHandle": receipt_handle,
+                "Body": json.dumps(task_payload)
+            }]
+        }
+
+        mock_body = unittest.mock.MagicMock()
+        mock_body.read.return_value = valid_bytes
+        mock_s3_worker.get_object.return_value = {"Body": mock_body}
+
+        consumer = WorkerTaskConsumer(
+            node_id="worker-test",
+            queue_url="https://sqs.us-east-2.amazonaws.com/123/queue",
+            bucket_name="test-bucket",
+            aws_ingestion_enabled=True
+        )
+        consumer._sqs_client = mock_sqs_worker
+        consumer._s3_client = mock_s3_worker
+
+        processed = asyncio.run(consumer.poll_and_process_one())
+        self.assertTrue(processed)
+
+        # Confirm delete_message was invoked with the exact ReceiptHandle
+        mock_sqs_worker.delete_message.assert_called_once_with(
+            QueueUrl="https://sqs.us-east-2.amazonaws.com/123/queue",
+            ReceiptHandle=receipt_handle
+        )
+        self.assertEqual(consumer.tasks_processed, 1)
+
+    def test_batch_progressive_redis_state_updates(self):
+        """
+        Req 3: Atualização progressiva do estado do lote no Redis e via polling endpoint.
+        """
+        from node2_worker.sqs_task_consumer import WorkerTaskConsumer
+
+        batch_id = "batch-prog-001"
+        initial_tracker = {
+            "batch_id": batch_id,
+            "total_modules": 3,
+            "completed_modules": 0,
+            "failed_modules": 0,
+            "status": "PROCESSING",
+            "created_at": "2026-11-10T12:00:00Z",
+            "updated_at": "2026-11-10T12:00:00Z",
+            "results": []
+        }
+        worker_module._SHARED_LOCAL_BATCH_STORE[batch_id] = initial_tracker
+
+        consumer = WorkerTaskConsumer(node_id="worker-1", aws_ingestion_enabled=False)
+
+        # 1st module completed
+        mod_1 = {"module_id": "M1", "status": "PASS", "module_damage_percentage": 1.0}
+        asyncio.run(consumer.update_batch_tracker(batch_id, mod_1))
+        r1 = self.gateway_client.get(f"/api/v1/batches/{batch_id}").json()
+        self.assertEqual(r1["completed_modules"], 1)
+        self.assertEqual(r1["status"], "PROCESSING")
+        self.assertEqual(r1["progress_percentage"], 33.3)
+
+        # 2nd module completed
+        mod_2 = {"module_id": "M2", "status": "FAIL", "module_damage_percentage": 10.0}
+        asyncio.run(consumer.update_batch_tracker(batch_id, mod_2))
+        r2 = self.gateway_client.get(f"/api/v1/batches/{batch_id}").json()
+        self.assertEqual(r2["completed_modules"], 2)
+        self.assertEqual(r2["status"], "PROCESSING")
+        self.assertEqual(r2["progress_percentage"], 66.7)
+
+        # 3rd module completed -> triggers status = COMPLETED
+        mod_3 = {"module_id": "M3", "status": "PASS", "module_damage_percentage": 2.0}
+        asyncio.run(consumer.update_batch_tracker(batch_id, mod_3))
+        r3 = self.gateway_client.get(f"/api/v1/batches/{batch_id}").json()
+        self.assertEqual(r3["completed_modules"], 3)
+        self.assertEqual(r3["status"], "COMPLETED")
+        self.assertEqual(r3["progress_percentage"], 100.0)
+        self.assertEqual(r3["batch_summary"]["total_modules"], 3)
+        self.assertEqual(r3["batch_summary"]["defective_modules_count"], 1)
+
+    def test_work_queue_offline_fallback_when_aws_disabled(self):
+        """
+        Req 4: Modo de fallback com AWS_INGESTION_ENABLED=false:
+        opera 100% offline via filas em memória e Redis local sem credenciais AWS.
+        """
+        from node2_worker.sqs_task_consumer import WorkerTaskConsumer
+
+        consumer = WorkerTaskConsumer(
+            node_id="worker-offline",
+            aws_ingestion_enabled=False
+        )
+        self.assertIsNone(consumer._s3_client)
+        self.assertIsNone(consumer._sqs_client)
+
+        img_path = self.fixtures_dir / "scan_module_6x10_pass.png"
+        with open(img_path, "rb") as f:
+            valid_bytes = f.read()
+
+        # Gateway bulk post offline
+        with patch.object(gateway_module, "AWS_INGESTION_ENABLED", False):
+            files = [("files", ("offline_panel.png", valid_bytes, "image/png"))]
+            resp = self.gateway_client.post("/api/v1/analyze/bulk", files=files)
+            self.assertEqual(resp.status_code, 202)
+            batch_id = resp.json()["batch_id"]
+
+        # Worker offline consumer processes task directly from fallback queue
+        did_work = asyncio.run(consumer.poll_and_process_one())
+        self.assertTrue(did_work)
+
+        # Status becomes COMPLETED
+        poll_resp = self.gateway_client.get(f"/api/v1/batches/{batch_id}")
+        self.assertEqual(poll_resp.status_code, 200)
+        self.assertEqual(poll_resp.json()["status"], "COMPLETED")
+        self.assertEqual(consumer.tasks_processed, 1)
 
 
 if __name__ == "__main__":

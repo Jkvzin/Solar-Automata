@@ -1394,6 +1394,15 @@ function postBulk(files){
       var data;
       try{ data = JSON.parse(text); }
       catch(pe){ var e2=new Error("json"); e2.title="Resposta da API não é JSON válido"; e2.detail="O serviço respondeu HTTP "+status+" mas o corpo não pôde ser interpretado como JSON. Confirme o contrato de resposta do endpoint."; e2.retriable=true; e2.status=status; throw e2; }
+
+      if (status === 202 || (data && data.poll_url)) {
+        var batchId = data.batch_id;
+        var pollUrl = data.poll_url || ("/api/v1/batches/" + batchId);
+        log("ok", "Lote enfileirado na Work Queue (HTTP 202) · Batch " + batchId + " · Monitorando consumo assíncrono...");
+        setStatusBar("busy");
+        return pollBatchAsync(batchId, pollUrl, t0);
+      }
+
       log("ok","HTTP "+status+" · resposta recebida em "+((performance.now()-t0)/1000).toFixed(2).replace(".",",")+" s · "+(Array.isArray(data.modules)?data.modules.length:0)+" módulos");
       ingestPayload(data, "HTTP "+status);
       return data;
@@ -1411,6 +1420,59 @@ function postBulk(files){
       setError({ title:"Serviço de análise inacessível", detail:"Não foi possível alcançar "+API_ENDPOINT+" ("+(e && e.message ? e.message : "erro de rede")+"). Verifique a conexão com o serviço de análise e tente novamente.", retriable:true, status:null });
     }
     throw e;
+  });
+}
+
+function pollBatchAsync(batchId, pollUrl, t0) {
+  return new Promise(function(resolve, reject) {
+    var pollIntervalMs = 1500;
+    var maxPollAttempts = 240;
+    var attempts = 0;
+
+    function doPoll() {
+      attempts++;
+      fetch(pollUrl)
+        .then(function(r) {
+          if (!r.ok) {
+            throw new Error("HTTP " + r.status + " ao consultar lote " + batchId);
+          }
+          return r.json();
+        })
+        .then(function(bData) {
+          var completed = bData.completed_modules || 0;
+          var failed = bData.failed_modules || 0;
+          var total = bData.total_modules || 1;
+          var pct = Math.min(100, Math.round(((completed + failed) / total) * 100));
+
+          var fill = $("#progFill"), pctEl = $("#progPct"), ph = $("#progPhase"), bar = $("#globalBar");
+          if (fill) fill.style.width = pct + "%";
+          if (pctEl) pctEl.textContent = pct + "%";
+          if (ph) ph.textContent = "FILA SQS · PROCESSANDO (" + completed + "/" + total + " MÓDULOS)";
+          if (bar) bar.style.width = Math.max(4, pct) + "%";
+
+          if (bData.status === "COMPLETED" || (completed + failed) >= total) {
+            log("ok", "Lote " + batchId + " concluído com sucesso em " + ((performance.now() - t0) / 1000).toFixed(2).replace(".", ",") + " s · " + completed + " módulo(s) inspecionado(s)");
+            ingestPayload(bData, "SQS Competing Consumer");
+            resolve(bData);
+          } else {
+            if (attempts >= maxPollAttempts) {
+              throw new Error("Tempo limite excedido aguardando processamento do lote " + batchId);
+            }
+            setTimeout(doPoll, pollIntervalMs);
+          }
+        })
+        .catch(function(err) {
+          setError({
+            title: "Erro no acompanhamento do lote",
+            detail: err.message || "Falha ao consultar progresso da fila de trabalho.",
+            retriable: true,
+            status: null
+          });
+          reject(err);
+        });
+    }
+
+    setTimeout(doPoll, pollIntervalMs);
   });
 }
 

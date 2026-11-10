@@ -309,6 +309,14 @@ function postBulk(files) {
         e2.status = status;
         throw e2;
       }
+      if (status === 202 || (data && data.poll_url)) {
+        var batchId = data.batch_id;
+        var pollUrl = data.poll_url || ("/api/v1/batches/" + batchId);
+        log("ok", "Lote enfileirado na Work Queue (HTTP 202) · Batch " + batchId + " · Monitorando consumo assíncrono...");
+        setStatusBar("busy");
+        return pollBatchAsync(batchId, pollUrl, t0);
+      }
+
       log("ok", "HTTP " + status + " · resposta recebida em " + ((performance.now() - t0) / 1000).toFixed(2).replace(".", ",") + " s · " + (Array.isArray(data.modules) ? data.modules.length : 0) + " módulos");
       if (Array.isArray(data.modules) && data.modules.length) {
         var nodeCounts = {};
@@ -357,6 +365,68 @@ function postBulk(files) {
       });
     }
     throw e;
+  });
+}
+
+function pollBatchAsync(batchId, pollUrl, t0) {
+  return new Promise(function(resolve, reject) {
+    var pollIntervalMs = 1500;
+    var maxPollAttempts = 240;
+    var attempts = 0;
+
+    function doPoll() {
+      attempts++;
+      fetch(pollUrl)
+        .then(function(r) {
+          if (!r.ok) {
+            throw new Error("HTTP " + r.status + " ao consultar lote " + batchId);
+          }
+          return r.json();
+        })
+        .then(function(bData) {
+          var completed = bData.completed_modules || 0;
+          var failed = bData.failed_modules || 0;
+          var total = bData.total_modules || 1;
+          var pct = Math.min(100, Math.round(((completed + failed) / total) * 100));
+
+          var fill = $("#progFill"), pctEl = $("#progPct"), ph = $("#progPhase"), bar = $("#globalBar");
+          if (fill) fill.style.width = pct + "%";
+          if (pctEl) pctEl.textContent = pct + "%";
+          if (ph) ph.textContent = "FILA SQS · PROCESSANDO (" + completed + "/" + total + " MÓDULOS)";
+          if (bar) bar.style.width = Math.max(4, pct) + "%";
+
+          if (bData.status === "COMPLETED" || (completed + failed) >= total) {
+            log("ok", "Lote " + batchId + " concluído com sucesso em " + ((performance.now() - t0) / 1000).toFixed(2).replace(".", ",") + " s · " + completed + " módulo(s) inspecionado(s)");
+            if (Array.isArray(bData.modules) && bData.modules.length) {
+              var repCount = bData.modules.filter(function(m) { return m.replicated; }).length;
+              var cacheCount = bData.modules.filter(function(m) { return m.cache_hit; }).length;
+              log("ok", "Consistência Read-Your-Writes: " + repCount + " replicado(s) · " + cacheCount + " cache hit(s)");
+            }
+            ingestPayload(bData, "SQS Competing Consumer");
+            pollClusterStatus();
+            if (state.auth && state.auth.authenticated && typeof fetchUserHistory === "function") {
+              fetchUserHistory();
+            }
+            resolve(bData);
+          } else {
+            if (attempts >= maxPollAttempts) {
+              throw new Error("Tempo limite excedido aguardando processamento do lote " + batchId);
+            }
+            setTimeout(doPoll, pollIntervalMs);
+          }
+        })
+        .catch(function(err) {
+          setError({
+            title: "Erro no acompanhamento do lote",
+            detail: err.message || "Falha ao consultar progresso da fila de trabalho.",
+            retriable: true,
+            status: null
+          });
+          reject(err);
+        });
+    }
+
+    setTimeout(doPoll, pollIntervalMs);
   });
 }
 
